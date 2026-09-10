@@ -64,6 +64,20 @@ no character or chat open to pin to.
 
 They all act on the currently selected persona.
 
+## Sending images to the model
+
+A vision-capable model can be shown what your persona looks like, rather than only told.
+Under **Extensions → Persona Gallery**, set **Send images to the model** to either the image
+currently applied or the whole gallery, and pick a cap for how many the whole gallery sends.
+
+Each image is shrunk to fit within 1024 pixels, re-encoded as JPEG, and attached to your most
+recent message, preceded by a short line naming the persona and the image's gallery label. That
+label is the place to put a hint you want the model to act on.
+
+Two things to keep in mind. This needs a Chat Completion API, and nothing is sent on text
+completion backends. The images ride along with every request, so sending the whole gallery on
+a long chat is a real and repeated token cost.
+
 ## Where things are stored
 
 Images go in your user data folder under `user/images/persona-gallery-<avatar file name>/`.

@@ -5,9 +5,11 @@ import {
     getCurrentChatId,
     getRequestHeaders,
     getThumbnailUrl,
+    main_api,
     saveMetadata,
     saveSettingsDebounced,
 } from '../../../../script.js';
+import { isImageInliningSupported, oai_settings } from '../../../openai.js';
 import { extension_settings } from '../../../extensions.js';
 import { user_avatar, getCurrentConnectionObj, getUserAvatar, getUserAvatars } from '../../../personas.js';
 import { power_user } from '../../../power-user.js';
@@ -34,6 +36,12 @@ const defaultSettings = {
     confirmDelete: true,
     /** Sort order for the folder listing. */
     sortOrder: 'asc',
+    /** Whether gallery images are sent to the model: 'off', 'active' or 'all'. */
+    injectMode: 'off',
+    /** How many images to send when the whole gallery is sent. */
+    injectMax: 4,
+    /** Longest edge, in pixels, of an image before it is sent. */
+    injectMaxEdge: 1024,
 };
 
 /** Sanitized folder names, keyed by avatar id, so we don't re-ask the server on every render. */
@@ -44,6 +52,12 @@ let activeGallery = null;
 
 /** Set while an avatar is being written, so overlapping switches cannot interleave. */
 let applyInFlight = false;
+
+/** Downscaled data URLs, keyed by gallery path. Gallery files never change in place. */
+const encodedImages = new Map();
+
+/** Whether the missing-vision-support warning has already been logged this session. */
+let warnedAboutVision = false;
 
 /**
  * @typedef {object} GalleryImage
@@ -943,6 +957,147 @@ async function openGallery(avatarId) {
 }
 
 /* -------------------------------------------------------------------------- */
+/*                             Sending to the model                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Reads a gallery image and returns it as a data URL, shrunk to a sane size.
+ * Reference images ride along with every request, so a full resolution portrait
+ * would be paid for on every turn.
+ * @param {string} url Gallery path, relative to the user data root.
+ * @returns {Promise<string|null>}
+ */
+async function encodeForPrompt(url) {
+    if (encodedImages.has(url)) {
+        return encodedImages.get(url);
+    }
+
+    try {
+        const response = await fetch(url, { cache: 'force-cache' });
+
+        if (!response.ok) {
+            throw new Error(`Could not read ${url}`);
+        }
+
+        const bitmap = await createImageBitmap(await response.blob());
+        const maxEdge = Math.max(64, Number(getSettings().injectMaxEdge) || 1024);
+        const scale = Math.min(1, maxEdge / Math.max(bitmap.width, bitmap.height));
+
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.round(bitmap.width * scale);
+        canvas.height = Math.round(bitmap.height * scale);
+        canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+        bitmap.close();
+
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+
+        // Keep the cache from growing without bound across many personas.
+        if (encodedImages.size > 32) {
+            encodedImages.delete(encodedImages.keys().next().value);
+        }
+
+        encodedImages.set(url, dataUrl);
+        return dataUrl;
+    } catch (error) {
+        console.error('[Persona Gallery] Could not encode an image for the prompt', error);
+        return null;
+    }
+}
+
+/**
+ * Which images this turn should carry.
+ * @param {string} avatarId
+ * @returns {Promise<GalleryImage[]>}
+ */
+async function getImagesToSend(avatarId) {
+    const settings = getSettings();
+    const images = await listGallery(avatarId);
+
+    if (!images?.length) {
+        return [];
+    }
+
+    if (settings.injectMode === 'all') {
+        return images.slice(0, Math.max(1, Number(settings.injectMax) || 1));
+    }
+
+    const meta = getMeta(avatarId);
+    return [images.find(image => image.file === meta.active) ?? images[0]];
+}
+
+/**
+ * Attaches the persona's images to the outgoing prompt so a vision model can see them.
+ * SillyTavern hands us the finished message array and sends whatever we leave behind.
+ * @param {{ chat: object[], dryRun: boolean }} eventData
+ */
+async function onPromptReady(eventData) {
+    const settings = getSettings();
+
+    if (settings.injectMode === 'off' || !Array.isArray(eventData?.chat)) {
+        return;
+    }
+
+    // Only Chat Completion carries image parts; text completion has nowhere to put them.
+    if (main_api !== 'openai') {
+        return;
+    }
+
+    if (!isImageInliningSupported() && !warnedAboutVision) {
+        warnedAboutVision = true;
+        console.warn('[Persona Gallery] Sending persona images, but SillyTavern does not list this model as vision capable. Turn image sending off if the API rejects the request.');
+    }
+
+    const avatarId = user_avatar;
+
+    if (!avatarId) {
+        return;
+    }
+
+    const images = await getImagesToSend(avatarId);
+
+    if (!images.length) {
+        return;
+    }
+
+    // The last user turn is the one position every vision API accepts images in.
+    const target = [...eventData.chat].reverse().find(message => message.role === 'user')
+        ?? eventData.chat[eventData.chat.length - 1];
+
+    if (!target) {
+        return;
+    }
+
+    if (typeof target.content === 'string') {
+        target.content = target.content ? [{ type: 'text', text: target.content }] : [];
+    }
+
+    if (!Array.isArray(target.content)) {
+        return;
+    }
+
+    const quality = oai_settings?.inline_image_quality || 'auto';
+    const name = personaName(avatarId);
+    let sent = 0;
+
+    for (const image of images) {
+        const dataUrl = await encodeForPrompt(image.url);
+
+        if (!dataUrl) {
+            continue;
+        }
+
+        const caption = image.label ? `${name}, ${image.label}` : name;
+        target.content.push({ type: 'text', text: `[Reference image of ${caption}]` });
+        target.content.push({ type: 'image_url', image_url: { url: dataUrl, detail: quality } });
+        sent++;
+    }
+
+    if (sent) {
+        console.debug(`[Persona Gallery] Sent ${sent} reference image(s) for ${name}.`);
+    }
+}
+
+/* -------------------------------------------------------------------------- */
 /*                              Slash commands                                */
 /* -------------------------------------------------------------------------- */
 
@@ -1088,6 +1243,19 @@ function addSettingsPanel() {
                     <option value="asc">Oldest first</option>
                     <option value="desc">Newest first</option>
                 </select>
+                <label for="pg_inject_mode">Send images to the model</label>
+                <select id="pg_inject_mode" class="text_pole">
+                    <option value="off">Do not send</option>
+                    <option value="active">The image currently applied</option>
+                    <option value="all">The whole gallery</option>
+                </select>
+                <label for="pg_inject_max">Most images to send at once</label>
+                <input id="pg_inject_max" class="text_pole" type="number" min="1" max="20" step="1">
+                <div class="opacity50p marginTop10">
+                    Sending needs a Chat Completion API and a model that accepts images. Each
+                    one is shrunk and attached to your latest message, labelled with its gallery
+                    name, on every request.
+                </div>
                 <div class="opacity50p marginTop10">
                     Images are stored in the user data folder, under
                     <code>user/images/persona-gallery-&lt;persona&gt;</code>.
@@ -1101,10 +1269,34 @@ function addSettingsPanel() {
     const autoImport = /** @type {HTMLInputElement} */ (document.getElementById('pg_auto_import'));
     const confirmDelete = /** @type {HTMLInputElement} */ (document.getElementById('pg_confirm_delete'));
     const sortOrder = /** @type {HTMLSelectElement} */ (document.getElementById('pg_sort_order'));
+    const injectMode = /** @type {HTMLSelectElement} */ (document.getElementById('pg_inject_mode'));
+    const injectMax = /** @type {HTMLInputElement} */ (document.getElementById('pg_inject_max'));
 
     autoImport.checked = settings.autoImportCurrent;
     confirmDelete.checked = settings.confirmDelete;
     sortOrder.value = settings.sortOrder;
+    injectMode.value = settings.injectMode;
+    injectMax.value = String(settings.injectMax);
+
+    const syncInjectVisibility = () => {
+        injectMax.parentElement.querySelector('label[for="pg_inject_max"]')
+            ?.classList.toggle('displayNone', injectMode.value !== 'all');
+        injectMax.classList.toggle('displayNone', injectMode.value !== 'all');
+    };
+
+    syncInjectVisibility();
+
+    injectMode.addEventListener('change', () => {
+        getSettings().injectMode = injectMode.value;
+        syncInjectVisibility();
+        saveSettingsDebounced();
+    });
+
+    injectMax.addEventListener('input', () => {
+        const value = Number(injectMax.value);
+        getSettings().injectMax = Number.isFinite(value) ? Math.min(20, Math.max(1, value)) : 4;
+        saveSettingsDebounced();
+    });
 
     autoImport.addEventListener('change', () => {
         getSettings().autoImportCurrent = autoImport.checked;
@@ -1181,6 +1373,9 @@ jQuery(async () => {
     // Opening a chat, or changing persona inside one, can pin a different image.
     eventSource.on(event_types.CHAT_CHANGED, () => applyLockedImage());
     eventSource.on(event_types.PERSONA_CHANGED, () => applyLockedImage());
+
+    // The last chance to add anything to a Chat Completion request.
+    eventSource.on(event_types.CHAT_COMPLETION_PROMPT_READY, onPromptReady);
 
     console.log('[Persona Gallery] Ready.');
 });
