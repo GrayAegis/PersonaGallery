@@ -1374,8 +1374,11 @@ jQuery(async () => {
     eventSource.on(event_types.CHAT_CHANGED, () => applyLockedImage());
     eventSource.on(event_types.PERSONA_CHANGED, () => applyLockedImage());
 
-    // The last chance to add anything to a Chat Completion request.
+    // Add the images before anything else looks at the prompt. Without makeFirst, a
+    // lower loading_order extension such as Prompt Inspector reads and displays the
+    // prompt before we have touched it, and the images look like they never went out.
     eventSource.on(event_types.CHAT_COMPLETION_PROMPT_READY, onPromptReady);
+    eventSource.makeFirst(event_types.CHAT_COMPLETION_PROMPT_READY, onPromptReady);
 
     console.log('[Persona Gallery] Ready.');
 });
