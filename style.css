@@ -137,3 +137,23 @@
 .persona-gallery-popup .pg-hint {
     font-size: 0.85em;
 }
+
+.persona-gallery-popup .pg-locks {
+    gap: 8px;
+    flex-wrap: wrap;
+    padding-top: 8px;
+    border-top: 1px solid var(--SmartThemeBorderColor);
+}
+
+.persona-gallery-popup .pg-locks-label {
+    font-size: 0.85em;
+}
+
+.persona-gallery-popup .pg-lock.pg-locked {
+    color: var(--golden);
+    border-color: var(--golden);
+}
+
+.persona-gallery-popup .pg-lock.pg-lock-unavailable {
+    opacity: 0.35;
+}

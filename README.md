@@ -27,8 +27,29 @@ Inside the gallery:
 - The bin icon removes the image from the gallery folder without touching the persona.
 
 The first time you open a gallery for a persona, the avatar it already has is copied in as
-`Original`, so switching away from it is reversible. Turn that off under
-**Extensions → Persona Gallery** if you would rather start empty.
+`Original`, so switching away from it is reversible. Any picture you later set with
+SillyTavern's own Change Persona Image button is captured into the gallery too, so a switch
+can never discard it. Turn the first-time copy off under **Extensions → Persona Gallery** if
+you would rather start empty.
+
+## Pinning an image
+
+The row under the grid pins whichever image is currently applied, in the same three scopes
+SillyTavern uses for personas themselves.
+
+| Pin | Effect |
+| --- | --- |
+| Default | Use this image whenever no other rule applies |
+| Character | Use this image while this character or group is open |
+| Chat | Use this image while this chat is open |
+
+The most specific rule wins, so a chat pin beats a character pin, which beats the default.
+Pins are re-evaluated when you open a chat and when you change persona, so wandering off to
+another image by hand lasts only until the next chat load. Character pins and the default are
+stored per persona; a chat pin lives in that chat's metadata and travels with the chat file.
+
+Buttons are dimmed when they cannot be used, which means no image is applied yet, or there is
+no character or chat open to pin to.
 
 ## Slash commands
 
@@ -60,7 +81,10 @@ lost by accident. Delete the folder yourself if you want the files gone.
 - Avatars are not resized on upload unless you crop them, so the gallery copy and the applied
   avatar are the same resolution.
 - Switching rewrites the persona's avatar file in place. Anything already pointing at that file,
-  including past chat messages, shows the new image.
+  including past chat messages, shows the new image. Pinning an image to a chat is the way to
+  keep a particular chat looking the way you left it.
+- Only one switch runs at a time. A second one that arrives while the first is still writing is
+  ignored, and the slash command returns an empty string so a script can tell.
 
 ## Installing elsewhere
 

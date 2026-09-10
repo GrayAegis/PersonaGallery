@@ -1,12 +1,15 @@
 import {
+    chat_metadata,
     eventSource,
     event_types,
+    getCurrentChatId,
     getRequestHeaders,
     getThumbnailUrl,
+    saveMetadata,
     saveSettingsDebounced,
 } from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
-import { user_avatar, getUserAvatar, getUserAvatars } from '../../../personas.js';
+import { user_avatar, getCurrentConnectionObj, getUserAvatar, getUserAvatars } from '../../../personas.js';
 import { power_user } from '../../../power-user.js';
 import { Popup, POPUP_TYPE, POPUP_RESULT } from '../../../popup.js';
 import { getBase64Async, getFileExtension, getSanitizedFilename, saveBase64AsFile } from '../../../utils.js';
@@ -20,6 +23,9 @@ import { t } from '../../../i18n.js';
 const MODULE_NAME = 'personaGallery';
 const FOLDER_PREFIX = 'persona-gallery';
 const ALLOWED_EXTENSIONS = ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'jfif'];
+
+/** Where a chat's pinned image is recorded, alongside SillyTavern's own chat metadata. */
+const CHAT_LOCK_KEY = 'personaGalleryImage';
 
 const defaultSettings = {
     /** Copy the persona's existing avatar into the gallery the first time it is opened. */
@@ -35,6 +41,9 @@ const folderNameCache = new Map();
 
 /** The gallery popup that is currently open, so slash commands can refresh it. */
 let activeGallery = null;
+
+/** Set while an avatar is being written, so overlapping switches cannot interleave. */
+let applyInFlight = false;
 
 /**
  * @typedef {object} GalleryImage
@@ -75,13 +84,17 @@ function getMeta(avatarId) {
     const settings = getSettings();
 
     if (!settings.meta[avatarId]) {
-        settings.meta[avatarId] = { active: null, labels: {}, imported: false };
+        settings.meta[avatarId] = { active: null, labels: {}, locks: {}, fallback: null, imported: false };
     }
 
     const meta = settings.meta[avatarId];
 
     if (!meta.labels || typeof meta.labels !== 'object') {
         meta.labels = {};
+    }
+
+    if (!meta.locks || typeof meta.locks !== 'object') {
+        meta.locks = {};
     }
 
     return meta;
@@ -119,11 +132,11 @@ async function resolveFolderName(avatarId) {
 /**
  * Reads the gallery folder for a persona.
  * @param {string} avatarId
- * @returns {Promise<GalleryImage[]>}
+ * @returns {Promise<GalleryImage[]|null>} The images, or null if the folder could not be read.
  */
 async function listGallery(avatarId) {
     if (!avatarId) {
-        return [];
+        return null;
     }
 
     const settings = getSettings();
@@ -141,7 +154,7 @@ async function listGallery(avatarId) {
 
     if (!response.ok) {
         console.error('[Persona Gallery] Failed to list gallery images', response.status);
-        return [];
+        return null;
     }
 
     const files = await response.json();
@@ -264,6 +277,15 @@ async function deleteImage(avatarId, image) {
         meta.active = null;
     }
 
+    // Leave no pin pointing at a file that is gone.
+    if (meta.fallback === image.file) {
+        meta.fallback = null;
+    }
+
+    Object.keys(meta.locks)
+        .filter(key => meta.locks[key] === image.file)
+        .forEach(key => delete meta.locks[key]);
+
     saveSettingsDebounced();
     return true;
 }
@@ -274,6 +296,13 @@ async function deleteImage(avatarId, image) {
  * @param {GalleryImage} image
  */
 async function applyImage(avatarId, image) {
+    if (applyInFlight) {
+        console.debug('[Persona Gallery] Ignoring a switch while another one is still running.');
+        return false;
+    }
+
+    applyInFlight = true;
+
     try {
         const source = await fetch(image.url, { cache: 'no-cache' });
 
@@ -314,6 +343,8 @@ async function applyImage(avatarId, image) {
         console.error('[Persona Gallery] Failed to apply the image', error);
         toastr.error(t`Failed to set the persona image.`);
         return false;
+    } finally {
+        applyInFlight = false;
     }
 }
 
@@ -364,6 +395,11 @@ async function refreshAvatarDisplays(avatarId) {
 async function cycleImage(avatarId, delta) {
     const images = await listGallery(avatarId);
 
+    if (!images) {
+        toastr.error(t`Could not read this persona's gallery.`);
+        return null;
+    }
+
     if (images.length < 2) {
         toastr.info(t`This persona needs at least two gallery images to cycle.`);
         return null;
@@ -373,9 +409,9 @@ async function cycleImage(avatarId, delta) {
     const current = images.findIndex(image => image.file === meta.active);
     const start = current === -1 ? 0 : current;
     const next = images[(start + delta + images.length) % images.length];
+    const applied = await applyImage(avatarId, next);
 
-    await applyImage(avatarId, next);
-    return next;
+    return applied ? next : null;
 }
 
 /**
@@ -403,6 +439,161 @@ function findImage(images, needle) {
         ?? images.find(image => image.label.toLowerCase().includes(lower))
         ?? images.find(image => image.file.toLowerCase().includes(lower))
         ?? null;
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                   Locks                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Key for the character or group currently in view, matching how SillyTavern
+ * keys its own persona connections.
+ * @returns {string|null}
+ */
+function currentConnectionKey() {
+    const connection = getCurrentConnectionObj();
+    return connection ? `${connection.type}:${connection.id}` : null;
+}
+
+/**
+ * The image a chat has pinned, if it belongs to the given persona.
+ * @param {string} avatarId
+ * @returns {string|null}
+ */
+function getChatLock(avatarId) {
+    const lock = chat_metadata?.[CHAT_LOCK_KEY];
+    return lock?.avatar === avatarId && lock.file ? lock.file : null;
+}
+
+/**
+ * The image pinned to the character or group currently in view.
+ * @param {string} avatarId
+ * @returns {string|null}
+ */
+function getCharacterLock(avatarId) {
+    const key = currentConnectionKey();
+    return key ? (getMeta(avatarId).locks[key] ?? null) : null;
+}
+
+/**
+ * Which image should be showing right now, most specific rule first.
+ * @param {string} avatarId
+ * @returns {string|null}
+ */
+function resolveLockedFile(avatarId) {
+    return getChatLock(avatarId)
+        ?? getCharacterLock(avatarId)
+        ?? getMeta(avatarId).fallback
+        ?? null;
+}
+
+/**
+ * Reads the state of all three scopes for the persona.
+ * @param {string} avatarId
+ */
+function getLockStates(avatarId) {
+    const meta = getMeta(avatarId);
+    const active = meta.active;
+
+    return {
+        available: {
+            default: true,
+            character: !!currentConnectionKey(),
+            chat: !!getCurrentChatId(),
+        },
+        locked: {
+            default: !!active && meta.fallback === active,
+            character: !!active && getCharacterLock(avatarId) === active,
+            chat: !!active && getChatLock(avatarId) === active,
+        },
+    };
+}
+
+/**
+ * Pins or unpins the persona's active image for one scope.
+ * @param {string} avatarId
+ * @param {'default'|'character'|'chat'} scope
+ */
+async function toggleLock(avatarId, scope) {
+    const meta = getMeta(avatarId);
+    const active = meta.active;
+
+    if (!active) {
+        toastr.info(t`Apply an image first, then pin it.`);
+        return;
+    }
+
+    const states = getLockStates(avatarId);
+
+    if (!states.available[scope]) {
+        toastr.info(scope === 'character'
+            ? t`Open a character or group chat first.`
+            : t`Open a chat first.`);
+        return;
+    }
+
+    const wasLocked = states.locked[scope];
+
+    if (scope === 'default') {
+        meta.fallback = wasLocked ? null : active;
+        saveSettingsDebounced();
+        return;
+    }
+
+    if (scope === 'character') {
+        const key = currentConnectionKey();
+
+        if (wasLocked) {
+            delete meta.locks[key];
+        } else {
+            meta.locks[key] = active;
+        }
+
+        saveSettingsDebounced();
+        return;
+    }
+
+    if (wasLocked) {
+        delete chat_metadata[CHAT_LOCK_KEY];
+    } else {
+        chat_metadata[CHAT_LOCK_KEY] = { avatar: avatarId, file: active };
+    }
+
+    // Write it now rather than on a debounce: leaving the chat within the next second
+    // would otherwise discard the pin the user just set.
+    await saveMetadata();
+}
+
+/**
+ * Applies whatever the current chat and character say this persona should be wearing.
+ */
+async function applyLockedImage() {
+    const avatarId = user_avatar;
+
+    if (!avatarId || applyInFlight) {
+        return;
+    }
+
+    const target = resolveLockedFile(avatarId);
+
+    if (!target || getMeta(avatarId).active === target) {
+        return;
+    }
+
+    const images = await listGallery(avatarId);
+
+    if (!images) {
+        return;
+    }
+
+    const image = images.find(candidate => candidate.file === target);
+
+    if (!image) {
+        console.debug('[Persona Gallery] A pinned image no longer exists:', target);
+        return;
+    }
+
+    await applyImage(avatarId, image);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -484,6 +675,16 @@ async function renderGallery(container, avatarId) {
 
     const images = await listGallery(avatarId);
     grid.classList.remove('pg-loading');
+    renderLockRow(container, avatarId);
+
+    if (!images) {
+        count.textContent = '';
+        const failed = document.createElement('div');
+        failed.classList.add('pg-empty');
+        failed.textContent = t`Could not read the gallery folder. Check the SillyTavern server log.`;
+        grid.appendChild(failed);
+        return;
+    }
 
     count.textContent = images.length === 1 ? t`1 image` : t`${images.length} images`;
 
@@ -539,6 +740,29 @@ async function renderGallery(container, avatarId) {
         tile.addEventListener('click', event => onTileClick(event, container, avatarId, image));
         grid.appendChild(tile);
     }
+}
+
+/**
+ * Paints the three pin buttons to match the current chat and character.
+ * @param {HTMLElement} container
+ * @param {string} avatarId
+ */
+function renderLockRow(container, avatarId) {
+    const states = getLockStates(avatarId);
+    const hasActive = !!getMeta(avatarId).active;
+
+    container.querySelectorAll('.pg-lock').forEach(button => {
+        const scope = button.getAttribute('data-scope');
+        const locked = states.locked[scope];
+        const usable = states.available[scope] && hasActive;
+
+        button.classList.toggle('pg-locked', locked);
+        button.classList.toggle('pg-lock-unavailable', !usable);
+
+        const icon = button.querySelector('i');
+        icon.classList.toggle('fa-lock', locked);
+        icon.classList.toggle('fa-unlock', !locked);
+    });
 }
 
 /**
@@ -606,6 +830,11 @@ async function openGallery(avatarId) {
         return;
     }
 
+    if (activeGallery) {
+        console.debug('[Persona Gallery] A gallery is already open.');
+        return;
+    }
+
     const container = document.createElement('div');
     container.classList.add('persona-gallery-popup');
     container.innerHTML = `
@@ -621,18 +850,55 @@ async function openGallery(avatarId) {
             </div>
         </div>
         <div class="pg-grid"></div>
+        <div class="pg-locks flex-container alignitemscenter">
+            <span class="pg-locks-label opacity50p"></span>
+            <div class="pg-lock menu_button menu_button_icon" data-scope="default">
+                <i class="fa-solid fa-unlock fa-fw"></i><span></span>
+            </div>
+            <div class="pg-lock menu_button menu_button_icon" data-scope="character">
+                <i class="fa-solid fa-unlock fa-fw"></i><span></span>
+            </div>
+            <div class="pg-lock menu_button menu_button_icon" data-scope="chat">
+                <i class="fa-solid fa-unlock fa-fw"></i><span></span>
+            </div>
+        </div>
         <div class="pg-hint opacity50p"></div>
     `;
 
     container.querySelector('.pg-heading h3').textContent = personaName(avatarId);
     container.querySelector('.pg-add span').textContent = t`Add images`;
+    container.querySelector('.pg-locks-label').textContent = t`Pin the current image to:`;
     container.querySelector('.pg-hint').textContent =
         t`Click an image to make it this persona's avatar. Drop image files here to add them.`;
+
+    const lockLabels = {
+        default: t`Default`,
+        character: t`Character`,
+        chat: t`Chat`,
+    };
+
+    const lockTitles = {
+        default: t`Use this image whenever no chat or character asks for another one.`,
+        character: t`Use this image while this character or group is open.`,
+        chat: t`Use this image while this chat is open.`,
+    };
+
+    container.querySelectorAll('.pg-lock').forEach(button => {
+        const scope = button.getAttribute('data-scope');
+        button.querySelector('span').textContent = lockLabels[scope];
+        button.title = lockTitles[scope];
+        button.addEventListener('click', async () => {
+            await toggleLock(avatarId, scope);
+            renderLockRow(container, avatarId);
+        });
+    });
 
     const meta = getMeta(avatarId);
     const existing = await listGallery(avatarId);
 
-    if (!existing.length && !meta.imported && getSettings().autoImportCurrent) {
+    // A failed listing must not look like an empty gallery, or the import would
+    // overwrite the saved original with whatever is applied right now.
+    if (existing && !existing.length && !meta.imported && getSettings().autoImportCurrent) {
         await importCurrentAvatar(avatarId);
     }
 
@@ -698,6 +964,12 @@ function registerSlashCommands() {
 
             if (!query) {
                 const images = await listGallery(avatarId);
+
+                if (!images) {
+                    toastr.error(t`Could not read this persona's gallery.`);
+                    return '';
+                }
+
                 return images.map((image, index) => `${index + 1}. ${image.label || image.file}`).join('\n');
             }
 
@@ -707,6 +979,12 @@ function registerSlashCommands() {
             }
 
             const images = await listGallery(avatarId);
+
+            if (!images) {
+                toastr.error(t`Could not read this persona's gallery.`);
+                return '';
+            }
+
             const image = findImage(images, query);
 
             if (!image) {
@@ -714,8 +992,8 @@ function registerSlashCommands() {
                 return '';
             }
 
-            await applyImage(avatarId, image);
-            return image.label || image.file;
+            const applied = await applyImage(avatarId, image);
+            return applied ? (image.label || image.file) : '';
         },
         unnamedArgumentList: [
             SlashCommandArgument.fromProps({
@@ -845,6 +1123,33 @@ function addSettingsPanel() {
 }
 
 /**
+ * SillyTavern's own Change Persona Image button overwrites the avatar file without
+ * telling anyone, which would leave that picture outside the gallery and lose it on
+ * the next switch. No event is emitted for it, so read the same file it was given.
+ */
+function watchExternalAvatarChanges() {
+    $('#avatar_upload_file').on('change', async function () {
+        // Read both synchronously: SillyTavern resets the form once it is finished.
+        const avatarId = String($('#avatar_upload_overwrite').val() || '');
+        const file = this.files?.[0];
+
+        if (!avatarId || !file) {
+            return;
+        }
+
+        const saved = await addImages(avatarId, [file]);
+
+        if (saved) {
+            console.debug('[Persona Gallery] Captured an externally set avatar for', avatarId);
+        }
+
+        if (activeGallery?.avatarId === avatarId) {
+            await renderGallery(activeGallery.container, avatarId);
+        }
+    });
+}
+
+/**
  * Drops metadata for personas that no longer exist.
  * @param {{ avatarId?: string }} data
  */
@@ -865,11 +1170,17 @@ jQuery(async () => {
     addSettingsPanel();
     registerSlashCommands();
 
+    watchExternalAvatarChanges();
+
     eventSource.on(event_types.PERSONA_DELETED, onPersonaDeleted);
 
     // The persona panel is rebuilt in some flows, so make sure the button survives.
     eventSource.on(event_types.PERSONA_CHANGED, () => addToolbarButton());
     eventSource.on(event_types.APP_READY, () => addToolbarButton());
+
+    // Opening a chat, or changing persona inside one, can pin a different image.
+    eventSource.on(event_types.CHAT_CHANGED, () => applyLockedImage());
+    eventSource.on(event_types.PERSONA_CHANGED, () => applyLockedImage());
 
     console.log('[Persona Gallery] Ready.');
 });
