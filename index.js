@@ -11,7 +11,7 @@ import {
 } from '../../../../script.js';
 import { isImageInliningSupported, oai_settings } from '../../../openai.js';
 import { extension_settings } from '../../../extensions.js';
-import { user_avatar, getCurrentConnectionObj, getUserAvatar, getUserAvatars } from '../../../personas.js';
+import { user_avatar, getCurrentConnectionObj, getUserAvatar } from '../../../personas.js';
 import { power_user } from '../../../power-user.js';
 import { Popup, POPUP_TYPE, POPUP_RESULT } from '../../../popup.js';
 import { getBase64Async, getFileExtension, getSanitizedFilename, saveBase64AsFile } from '../../../utils.js';
@@ -46,6 +46,14 @@ const defaultSettings = {
 
 /** Sanitized folder names, keyed by avatar id, so we don't re-ask the server on every render. */
 const folderNameCache = new Map();
+
+/**
+ * Folder listings by avatar id, so sending images does not cost a request per generation.
+ * Anything that changes a folder from inside the extension forgets its entry; opening the
+ * gallery reads fresh so files dropped into the folder by hand are picked up.
+ * @type {Map<string, { files: string[], folder: string }>}
+ */
+const galleryListings = new Map();
 
 /** The gallery popup that is currently open, so slash commands can refresh it. */
 let activeGallery = null;
@@ -156,49 +164,59 @@ async function resolveFolderName(avatarId) {
 /**
  * Reads the gallery folder for a persona.
  * @param {string} avatarId
+ * @param {object} [options]
+ * @param {boolean} [options.fresh=false] Ask the server even if a listing is cached.
  * @returns {Promise<GalleryImage[]|null>} The images, or null if the folder could not be read.
  */
-async function listGallery(avatarId) {
+async function listGallery(avatarId, { fresh = false } = {}) {
     if (!avatarId) {
         return null;
     }
 
-    const settings = getSettings();
     const meta = getMeta(avatarId);
+    let listing = fresh ? null : galleryListings.get(avatarId);
 
-    const response = await fetch('/api/images/list', {
-        method: 'POST',
-        headers: getRequestHeaders(),
-        body: JSON.stringify({
-            folder: rawFolderName(avatarId),
-            sortField: 'date',
-            sortOrder: settings.sortOrder,
-        }),
-    });
+    if (!listing) {
+        const response = await fetch('/api/images/list', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            body: JSON.stringify({
+                folder: rawFolderName(avatarId),
+                sortField: 'date',
+                sortOrder: getSettings().sortOrder,
+            }),
+        });
 
-    if (!response.ok) {
-        console.error('[Persona Gallery] Failed to list gallery images', response.status);
-        return null;
+        if (!response.ok) {
+            console.error('[Persona Gallery] Failed to list gallery images', response.status);
+            return null;
+        }
+
+        const files = await response.json();
+        const folder = await resolveFolderName(avatarId);
+
+        // Files can be removed from the folder by hand, so drop labels that no longer point anywhere.
+        const orphans = Object.keys(meta.labels).filter(file => !files.includes(file));
+
+        if (orphans.length) {
+            orphans.forEach(file => delete meta.labels[file]);
+            saveSettingsDebounced();
+        }
+
+        listing = {
+            files: files.filter(file => ALLOWED_EXTENSIONS.includes(String(file).split('.').pop().toLowerCase())),
+            folder,
+        };
+
+        galleryListings.set(avatarId, listing);
     }
 
-    const files = await response.json();
-    const folder = await resolveFolderName(avatarId);
-
-    // Files can be removed from the folder by hand, so drop labels that no longer point anywhere.
-    const orphans = Object.keys(meta.labels).filter(file => !files.includes(file));
-
-    if (orphans.length) {
-        orphans.forEach(file => delete meta.labels[file]);
-        saveSettingsDebounced();
-    }
-
-    return files
-        .filter(file => ALLOWED_EXTENSIONS.includes(String(file).split('.').pop().toLowerCase()))
-        .map(file => ({
-            file: file,
-            url: `user/images/${folder}/${file}`,
-            label: meta.labels[file] || '',
-        }));
+    // Labels are read live so a rename shows without another request.
+    return listing.files.map(file => ({
+        file: file,
+        url: `user/images/${listing.folder}/${file}`,
+        label: meta.labels[file] || '',
+    }));
 }
 
 /**
@@ -242,6 +260,7 @@ async function addImages(avatarId, files) {
     }
 
     if (saved.length) {
+        galleryListings.delete(avatarId);
         saveSettingsDebounced();
     }
 
@@ -270,6 +289,7 @@ async function importCurrentAvatar(avatarId) {
         meta.active = file;
         meta.labels[file] = t`Original`;
         meta.imported = true;
+        galleryListings.delete(avatarId);
         saveSettingsDebounced();
         return true;
     } catch (error) {
@@ -294,6 +314,8 @@ async function deleteImage(avatarId, image) {
         toastr.error(t`Failed to delete the image.`);
         return false;
     }
+
+    galleryListings.delete(avatarId);
 
     const meta = getMeta(avatarId);
     delete meta.labels[image.file];
@@ -389,8 +411,6 @@ async function refreshAvatarDisplays(avatarId) {
     // stamp it onto everything already on screen; the observer handles later renders.
     avatarVersions.set(avatarId, Date.now());
     freshenTree(document.body);
-
-    await getUserAvatars(true, avatarId);
 }
 
 /**
@@ -453,7 +473,12 @@ function versionedAvatarUrl(raw) {
         return null;
     }
 
-    parsed.url.searchParams.set('pg', version);
+    // The version goes first, not last. SillyTavern's avatar zoom reads the persona file
+    // name as whatever follows the final '=' in the thumbnail URL, so anything appended
+    // after 'file' makes it fail to recognise the persona and show the thumbnail instead
+    // of the full-size image. The other parameters keep their original encoding.
+    const rest = parsed.url.search.replace(/^\?/, '').split('&').filter(part => part && !part.startsWith('pg='));
+    parsed.url.search = [`pg=${version}`, ...rest].join('&');
 
     // Keep the URL relative to the site, the way SillyTavern and themes write it.
     return `${parsed.url.pathname}${parsed.url.search}${parsed.url.hash}`;
@@ -517,6 +542,12 @@ function freshenTree(root) {
  * chats, the persona list, and themes that normalise avatar URLs back to plain form.
  */
 function watchAvatarRenders() {
+    // Persona avatars appear outside the chat too: the persona panel, the zoomed avatar
+    // popup, Quick Persona's button in the send form. So the whole document is watched,
+    // and instead the busiest subtrees are skipped: message bodies, which stream text
+    // several times a second and never hold a persona avatar.
+    const insideMessageBody = node => node instanceof Element && !!node.closest('.mes_text, .mes_reasoning');
+
     const observer = new MutationObserver(mutations => {
         if (!avatarVersions.size) {
             return;
@@ -524,12 +555,15 @@ function watchAvatarRenders() {
 
         for (const mutation of mutations) {
             if (mutation.type === 'attributes') {
-                freshenElement(/** @type {Element} */ (mutation.target));
+                if (!insideMessageBody(mutation.target)) {
+                    freshenElement(/** @type {Element} */ (mutation.target));
+                }
+
                 continue;
             }
 
             mutation.addedNodes.forEach(node => {
-                if (node instanceof Element) {
+                if (node instanceof Element && !insideMessageBody(node)) {
                     freshenTree(node);
                 }
             });
@@ -617,13 +651,33 @@ function currentConnectionKey() {
 }
 
 /**
- * The image a chat has pinned, if it belongs to the given persona.
+ * The chat's pins, one per persona, migrating the single-pin shape older versions wrote.
+ * @returns {Record<string, string>}
+ */
+function getChatLocks() {
+    const raw = chat_metadata?.[CHAT_LOCK_KEY];
+
+    if (!raw || typeof raw !== 'object') {
+        return {};
+    }
+
+    if (typeof raw.avatar === 'string' && typeof raw.file === 'string') {
+        const migrated = { [raw.avatar]: raw.file };
+        chat_metadata[CHAT_LOCK_KEY] = migrated;
+        return migrated;
+    }
+
+    return raw;
+}
+
+/**
+ * The image a chat has pinned for the given persona.
  * @param {string} avatarId
  * @returns {string|null}
  */
 function getChatLock(avatarId) {
-    const lock = chat_metadata?.[CHAT_LOCK_KEY];
-    return lock?.avatar === avatarId && lock.file ? lock.file : null;
+    const file = getChatLocks()[avatarId];
+    return typeof file === 'string' && file ? file : null;
 }
 
 /**
@@ -714,10 +768,18 @@ async function toggleLock(avatarId, scope) {
         return;
     }
 
+    const locks = getChatLocks();
+
     if (wasLocked) {
-        delete chat_metadata[CHAT_LOCK_KEY];
+        delete locks[avatarId];
     } else {
-        chat_metadata[CHAT_LOCK_KEY] = { avatar: avatarId, file: active };
+        locks[avatarId] = active;
+    }
+
+    if (Object.keys(locks).length) {
+        chat_metadata[CHAT_LOCK_KEY] = locks;
+    } else {
+        delete chat_metadata[CHAT_LOCK_KEY];
     }
 
     // Write it now rather than on a debounce: leaving the chat within the next second
@@ -792,8 +854,14 @@ function pickFiles() {
 
         input.addEventListener('change', () => finish(Array.from(input.files || [])), { once: true });
 
-        // Nothing fires when the dialog is dismissed, so give up shortly after focus returns.
-        window.addEventListener('focus', () => setTimeout(() => finish([]), 1000), { once: true });
+        if ('oncancel' in input) {
+            // Modern browsers say so when the dialog is dismissed.
+            input.addEventListener('cancel', () => finish([]), { once: true });
+        } else {
+            // Older ones do not, so give up a while after focus returns. The change event
+            // normally lands first; the delay is generous so a slow selection is not lost.
+            window.addEventListener('focus', () => setTimeout(() => finish([]), 2500), { once: true });
+        }
 
         input.click();
     });
@@ -859,9 +927,12 @@ async function renderGallery(container, avatarId) {
 
     for (const [index, image] of images.entries()) {
         const tile = document.createElement('div');
-        tile.classList.add('pg-item');
+        // 'interactable' hands the tile to SillyTavern's keyboard layer: focusable, Enter and Space click.
+        tile.classList.add('pg-item', 'interactable');
         tile.dataset.file = image.file;
         tile.title = t`Click to use this image for the persona`;
+        tile.setAttribute('role', 'button');
+        tile.setAttribute('aria-label', t`Use ${image.label || image.file} for this persona`);
 
         if (meta.active === image.file) {
             tile.classList.add('pg-active');
@@ -888,13 +959,17 @@ async function renderGallery(container, avatarId) {
         actions.classList.add('pg-actions');
 
         const rename = document.createElement('i');
-        rename.className = 'fa-solid fa-tag pg-action pg-rename';
+        rename.className = 'fa-solid fa-tag pg-action pg-rename interactable';
         rename.title = t`Set a label`;
+        rename.setAttribute('role', 'button');
+        rename.setAttribute('aria-label', t`Set a label for ${image.label || image.file}`);
         actions.appendChild(rename);
 
         const remove = document.createElement('i');
-        remove.className = 'fa-solid fa-trash-can pg-action pg-delete';
+        remove.className = 'fa-solid fa-trash-can pg-action pg-delete interactable';
         remove.title = t`Delete this image`;
+        remove.setAttribute('role', 'button');
+        remove.setAttribute('aria-label', t`Delete ${image.label || image.file}`);
         actions.appendChild(remove);
 
         tile.appendChild(actions);
@@ -919,6 +994,9 @@ function renderLockRow(container, avatarId) {
 
         button.classList.toggle('pg-locked', locked);
         button.classList.toggle('pg-lock-unavailable', !usable);
+        button.setAttribute('role', 'button');
+        button.setAttribute('aria-pressed', String(locked));
+        button.setAttribute('aria-disabled', String(!usable));
 
         const icon = button.querySelector('i');
         icon.classList.toggle('fa-lock', locked);
@@ -1055,7 +1133,7 @@ async function openGallery(avatarId) {
     });
 
     const meta = getMeta(avatarId);
-    const existing = await listGallery(avatarId);
+    const existing = await listGallery(avatarId, { fresh: true });
 
     // A failed listing must not look like an empty gallery, or the import would
     // overwrite the saved original with whatever is applied right now.
@@ -1352,6 +1430,8 @@ function addToolbarButton() {
     button.id = 'persona_gallery_button';
     button.className = 'menu_button fa-solid fa-images';
     button.title = t`Persona Gallery\n\nClick to open\nShift-click for the next image`;
+    button.setAttribute('role', 'button');
+    button.setAttribute('aria-label', t`Persona Gallery`);
 
     button.addEventListener('click', async event => {
         if (event.shiftKey) {
@@ -1403,6 +1483,8 @@ function addSettingsPanel() {
                 </select>
                 <label for="pg_inject_max">Most images to send at once</label>
                 <input id="pg_inject_max" class="text_pole" type="number" min="1" max="20" step="1">
+                <label for="pg_inject_edge">Longest edge of a sent image, in pixels</label>
+                <input id="pg_inject_edge" class="text_pole" type="number" min="256" max="4096" step="64">
                 <div class="opacity50p marginTop10">
                     Sending needs a Chat Completion API and a model that accepts images. Each
                     one is shrunk and attached to your latest message, labelled with its gallery
@@ -1423,17 +1505,23 @@ function addSettingsPanel() {
     const sortOrder = /** @type {HTMLSelectElement} */ (document.getElementById('pg_sort_order'));
     const injectMode = /** @type {HTMLSelectElement} */ (document.getElementById('pg_inject_mode'));
     const injectMax = /** @type {HTMLInputElement} */ (document.getElementById('pg_inject_max'));
+    const injectEdge = /** @type {HTMLInputElement} */ (document.getElementById('pg_inject_edge'));
 
     autoImport.checked = settings.autoImportCurrent;
     confirmDelete.checked = settings.confirmDelete;
     sortOrder.value = settings.sortOrder;
     injectMode.value = settings.injectMode;
     injectMax.value = String(settings.injectMax);
+    injectEdge.value = String(settings.injectMaxEdge);
+
+    const showControl = (control, visible) => {
+        control.classList.toggle('displayNone', !visible);
+        control.parentElement.querySelector(`label[for="${control.id}"]`)?.classList.toggle('displayNone', !visible);
+    };
 
     const syncInjectVisibility = () => {
-        injectMax.parentElement.querySelector('label[for="pg_inject_max"]')
-            ?.classList.toggle('displayNone', injectMode.value !== 'all');
-        injectMax.classList.toggle('displayNone', injectMode.value !== 'all');
+        showControl(injectMax, injectMode.value === 'all');
+        showControl(injectEdge, injectMode.value !== 'off');
     };
 
     syncInjectVisibility();
@@ -1450,6 +1538,14 @@ function addSettingsPanel() {
         saveSettingsDebounced();
     });
 
+    injectEdge.addEventListener('input', () => {
+        const value = Number(injectEdge.value);
+        getSettings().injectMaxEdge = Number.isFinite(value) ? Math.min(4096, Math.max(256, value)) : 1024;
+        // Cached encodings were made at the old size.
+        encodedImages.clear();
+        saveSettingsDebounced();
+    });
+
     autoImport.addEventListener('change', () => {
         getSettings().autoImportCurrent = autoImport.checked;
         saveSettingsDebounced();
@@ -1462,6 +1558,7 @@ function addSettingsPanel() {
 
     sortOrder.addEventListener('change', () => {
         getSettings().sortOrder = sortOrder.value;
+        galleryListings.clear();
         saveSettingsDebounced();
     });
 }

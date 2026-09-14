@@ -46,10 +46,14 @@ SillyTavern uses for personas themselves.
 The most specific rule wins, so a chat pin beats a character pin, which beats the default.
 Pins are re-evaluated when you open a chat and when you change persona, so wandering off to
 another image by hand lasts only until the next chat load. Character pins and the default are
-stored per persona; a chat pin lives in that chat's metadata and travels with the chat file.
+stored per persona; chat pins live in that chat's metadata and travel with the chat file, one
+per persona, so switching personas inside a chat does not lose the other one's pin.
 
 Buttons are dimmed when they cannot be used, which means no image is applied yet, or there is
 no character or chat open to pin to.
+
+Everything in the gallery can be reached from the keyboard: Tab moves between tiles, their
+label and delete controls, and the pin buttons; Enter or Space activates whichever is focused.
 
 ## Slash commands
 
@@ -70,9 +74,11 @@ A vision-capable model can be shown what your persona looks like, rather than on
 Under **Extensions → Persona Gallery**, set **Send images to the model** to either the image
 currently applied or the whole gallery, and pick a cap for how many the whole gallery sends.
 
-Each image is shrunk to fit within 1024 pixels, re-encoded as JPEG, and attached to your most
-recent message, preceded by a short line naming the persona and the image's gallery label. That
-label is the place to put a hint you want the model to act on.
+Each image is shrunk to fit within the longest-edge limit in the settings, 1024 pixels by
+default, re-encoded as JPEG, and attached to your most recent message, preceded by a short line
+naming the persona and the image's gallery label. That label is the place to put a hint you
+want the model to act on. A smaller edge means fewer tokens per image; a larger one keeps more
+detail.
 
 Two things to keep in mind. This needs a Chat Completion API, and nothing is sent on text
 completion backends. The images ride along with every request, so sending the whole gallery on
