@@ -63,6 +63,13 @@ const encodedImages = new Map();
 let warnedAboutVision = false;
 
 /**
+ * Type of the generation SillyTavern is currently building, or null between them.
+ * Quiet generations are background calls made by other extensions: summarisers,
+ * expression classifiers, captioners. They should not be paying for reference images.
+ */
+let currentGenerationType = null;
+
+/**
  * @typedef {object} GalleryImage
  * @property {string} file File name inside the gallery folder.
  * @property {string} url Path relative to the user data root.
@@ -198,11 +205,11 @@ async function listGallery(avatarId) {
  * Saves image files into a persona's gallery folder.
  * @param {string} avatarId
  * @param {File[]} files
- * @returns {Promise<number>} How many files were saved.
+ * @returns {Promise<string[]>} File names of the images that were saved, in order.
  */
 async function addImages(avatarId, files) {
     const folder = rawFolderName(avatarId);
-    let saved = 0;
+    const saved = [];
 
     for (const file of files) {
         const extension = getFileExtension(file) || 'png';
@@ -221,19 +228,20 @@ async function addImages(avatarId, files) {
             const stem = original.replace(/[^\w\- ]+/g, '').slice(0, 40) || 'image';
             const unique = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
             const path = await saveBase64AsFile(base64, folder, `${stem}-${unique}`, extension);
+            const savedName = String(path).split('/').pop();
 
             if (original) {
-                getMeta(avatarId).labels[String(path).split('/').pop()] = original;
+                getMeta(avatarId).labels[savedName] = original;
             }
 
-            saved++;
+            saved.push(savedName);
         } catch (error) {
             console.error('[Persona Gallery] Failed to save image', file.name, error);
             toastr.error(t`Failed to save ${file.name}.`);
         }
     }
 
-    if (saved) {
+    if (saved.length) {
         saveSettingsDebounced();
     }
 
@@ -412,7 +420,16 @@ function parsePersonaAvatarUrl(raw) {
         return avatarId ? { avatarId, url } : null;
     }
 
-    const path = decodeURIComponent(url.pathname);
+    // A malformed percent sequence in any same-origin image path, which a broken image
+    // link in a chat message can produce, would throw here and abort the observer batch.
+    let path;
+
+    try {
+        path = decodeURIComponent(url.pathname);
+    } catch {
+        return null;
+    }
+
     const marker = '/User Avatars/';
     const index = path.indexOf(marker);
 
@@ -790,13 +807,13 @@ function pickFiles() {
 async function addAndReport(avatarId, files) {
     const saved = await addImages(avatarId, files);
 
-    if (saved === 1) {
+    if (saved.length === 1) {
         toastr.success(t`Added 1 image.`);
-    } else if (saved > 1) {
-        toastr.success(t`Added ${saved} images.`);
+    } else if (saved.length > 1) {
+        toastr.success(t`Added ${saved.length} images.`);
     }
 
-    return saved;
+    return saved.length;
 }
 
 /**
@@ -1172,6 +1189,11 @@ async function onPromptReady(eventData) {
         return;
     }
 
+    if (currentGenerationType === 'quiet') {
+        console.debug('[Persona Gallery] Skipping reference images for a background prompt.');
+        return;
+    }
+
     if (!isImageInliningSupported() && !warnedAboutVision) {
         warnedAboutVision = true;
         console.warn('[Persona Gallery] Sending persona images, but SillyTavern does not list this model as vision capable. Turn image sending off if the API rejects the request.');
@@ -1459,9 +1481,15 @@ function watchExternalAvatarChanges() {
             return;
         }
 
-        const saved = await addImages(avatarId, [file]);
+        const [savedName] = await addImages(avatarId, [file]);
 
-        if (saved) {
+        if (savedName) {
+            // That file is the avatar now, so the gallery, cycling, pins and the send-to-model
+            // option must all treat it as the applied one rather than the previous choice.
+            // If the crop dialog is cancelled the avatar keeps its old picture and this record
+            // is one step ahead; the next switch or chat load puts it right.
+            getMeta(avatarId).active = savedName;
+            saveSettingsDebounced();
             console.debug('[Persona Gallery] Captured an externally set avatar for', avatarId);
         }
 
@@ -1504,6 +1532,13 @@ jQuery(async () => {
     // Opening a chat, or changing persona inside one, can pin a different image.
     eventSource.on(event_types.CHAT_CHANGED, () => applyLockedImage());
     eventSource.on(event_types.PERSONA_CHANGED, () => applyLockedImage());
+
+    // GENERATION_STARTED fires earlier in the same Generate call with the type, which
+    // the prompt-ready event does not carry. Dry runs never reach GENERATION_ENDED, so
+    // the type is cleared again at the start of the next call rather than only at the end.
+    eventSource.on(event_types.GENERATION_STARTED, type => { currentGenerationType = type; });
+    eventSource.on(event_types.GENERATION_ENDED, () => { currentGenerationType = null; });
+    eventSource.on(event_types.GENERATION_STOPPED, () => { currentGenerationType = null; });
 
     // Add the images before anything else looks at the prompt. Without makeFirst, a
     // lower loading_order extension such as Prompt Inspector reads and displays the

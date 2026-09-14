@@ -78,6 +78,9 @@ Two things to keep in mind. This needs a Chat Completion API, and nothing is sen
 completion backends. The images ride along with every request, so sending the whole gallery on
 a long chat is a real and repeated token cost.
 
+Background calls made by other extensions, such as summarisers, expression classifiers and
+captioners, do not get the images. Only the generations you trigger yourself carry them.
+
 To check what actually goes out, turn on Prompt Inspector from the wand menu and look for
 `image_url` entries on your last message. Persona Gallery puts itself first in the queue of
 things that touch a finished prompt, so the inspector sees the images rather than the prompt as
