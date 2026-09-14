@@ -103,6 +103,10 @@ lost by accident. Delete the folder yourself if you want the files gone.
 - Switching rewrites the persona's avatar file in place. Anything already pointing at that file,
   including past chat messages, shows the new image. Pinning an image to a chat is the way to
   keep a particular chat looking the way you left it.
+- Switching updates the chat live, including themes that paint avatars as CSS backgrounds,
+  such as Moonlit Echoes' Echo and Whisper styles. Browsers keep showing the old picture for an
+  unchanged URL until the page reloads, so each switch stamps a new version onto every URL for
+  that persona's avatar, including ones rendered or rewritten afterwards.
 - Only one switch runs at a time. A second one that arrives while the first is still writing is
   ignored, and the slash command returns an empty string so a script can tell.
 

@@ -53,6 +53,9 @@ let activeGallery = null;
 /** Set while an avatar is being written, so overlapping switches cannot interleave. */
 let applyInFlight = false;
 
+/** Avatars switched during this page load, each with a version stamped onto its URLs. */
+const avatarVersions = new Map();
+
 /** Downscaled data URLs, keyed by gallery path. Gallery files never change in place. */
 const encodedImages = new Map();
 
@@ -367,34 +370,161 @@ async function applyImage(avatarId, image) {
  * @param {string} avatarId
  */
 async function refreshAvatarDisplays(avatarId) {
-    const avatarUrl = getUserAvatar(avatarId);
-    const thumbUrl = getThumbnailUrl('persona', avatarId);
-
-    // Revalidate the cache entries so later renders of the plain URLs are correct.
+    // Revalidate the cache entries so a later page load gets the new file.
     await Promise.allSettled([
-        fetch(avatarUrl, { cache: 'reload' }),
-        fetch(thumbUrl, { cache: 'reload' }),
+        fetch(getUserAvatar(avatarId), { cache: 'reload' }),
+        fetch(getThumbnailUrl('persona', avatarId), { cache: 'reload' }),
     ]);
 
-    // Repaint the elements that are on screen right now.
-    const stamp = Date.now();
-
-    document.querySelectorAll('img').forEach(img => {
-        const src = img.getAttribute('src') || '';
-
-        if (src.startsWith('user/images/') || src.startsWith('/user/images/')) {
-            return;
-        }
-
-        if (!src.includes(encodeURIComponent(avatarId)) && !src.includes(avatarId)) {
-            return;
-        }
-
-        const base = src.split('#')[0].replace(/[?&]pg=\d+/, '');
-        img.setAttribute('src', `${base}${base.includes('?') ? '&' : '?'}pg=${stamp}`);
-    });
+    // Browsers keep the decoded image for a URL for as long as the page is open, so an
+    // unchanged URL keeps showing the old picture. Give this avatar a new version and
+    // stamp it onto everything already on screen; the observer handles later renders.
+    avatarVersions.set(avatarId, Date.now());
+    freshenTree(document.body);
 
     await getUserAvatars(true, avatarId);
+}
+
+/**
+ * Works out whether a URL points at a persona avatar or its thumbnail.
+ * @param {string} raw URL as written in an attribute or a CSS url()
+ * @returns {{ avatarId: string, url: URL }|null}
+ */
+function parsePersonaAvatarUrl(raw) {
+    if (!raw || raw.startsWith('data:') || raw.startsWith('blob:')) {
+        return null;
+    }
+
+    let url;
+
+    try {
+        url = new URL(raw, window.location.href);
+    } catch {
+        return null;
+    }
+
+    if (url.origin !== window.location.origin) {
+        return null;
+    }
+
+    if (url.pathname.endsWith('/thumbnail') && url.searchParams.get('type') === 'persona') {
+        const avatarId = url.searchParams.get('file');
+        return avatarId ? { avatarId, url } : null;
+    }
+
+    const path = decodeURIComponent(url.pathname);
+    const marker = '/User Avatars/';
+    const index = path.indexOf(marker);
+
+    return index === -1 ? null : { avatarId: path.slice(index + marker.length), url };
+}
+
+/**
+ * Returns the URL carrying the avatar's current version, or null if it needs no change.
+ * @param {string} raw
+ */
+function versionedAvatarUrl(raw) {
+    const parsed = parsePersonaAvatarUrl(raw);
+
+    if (!parsed || !avatarVersions.has(parsed.avatarId)) {
+        return null;
+    }
+
+    const version = String(avatarVersions.get(parsed.avatarId));
+
+    if (parsed.url.searchParams.get('pg') === version) {
+        return null;
+    }
+
+    parsed.url.searchParams.set('pg', version);
+
+    // Keep the URL relative to the site, the way SillyTavern and themes write it.
+    return `${parsed.url.pathname}${parsed.url.search}${parsed.url.hash}`;
+}
+
+/**
+ * Updates one element: an image source, and any avatar URLs held in inline styles.
+ * Themes such as Moonlit Echoes paint avatars as CSS backgrounds from custom
+ * properties, which an image-only refresh never reaches.
+ * @param {Element} element
+ */
+function freshenElement(element) {
+    if (element instanceof HTMLImageElement) {
+        const next = versionedAvatarUrl(element.getAttribute('src') || '');
+
+        if (next) {
+            element.setAttribute('src', next);
+        }
+    }
+
+    if (!(element instanceof HTMLElement) || !element.getAttribute('style')?.includes('url(')) {
+        return;
+    }
+
+    const style = element.style;
+
+    for (let index = 0; index < style.length; index++) {
+        const property = style[index];
+        const value = style.getPropertyValue(property);
+
+        if (!value.includes('url(')) {
+            continue;
+        }
+
+        const updated = value.replace(/url\(\s*(['"]?)(.*?)\1\s*\)/g, (match, quote, inner) => {
+            const next = versionedAvatarUrl(inner);
+            return next ? `url(${quote}${next}${quote})` : match;
+        });
+
+        if (updated !== value) {
+            style.setProperty(property, updated, style.getPropertyPriority(property));
+        }
+    }
+}
+
+/**
+ * Updates an element and everything inside it.
+ * @param {Element} root
+ */
+function freshenTree(root) {
+    if (!avatarVersions.size || !root) {
+        return;
+    }
+
+    freshenElement(root);
+    root.querySelectorAll('img, [style*="url("]').forEach(freshenElement);
+}
+
+/**
+ * Catches avatars rendered or rewritten after a switch: new messages, re-rendered
+ * chats, the persona list, and themes that normalise avatar URLs back to plain form.
+ */
+function watchAvatarRenders() {
+    const observer = new MutationObserver(mutations => {
+        if (!avatarVersions.size) {
+            return;
+        }
+
+        for (const mutation of mutations) {
+            if (mutation.type === 'attributes') {
+                freshenElement(/** @type {Element} */ (mutation.target));
+                continue;
+            }
+
+            mutation.addedNodes.forEach(node => {
+                if (node instanceof Element) {
+                    freshenTree(node);
+                }
+            });
+        }
+    });
+
+    observer.observe(document.body, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        attributeFilter: ['src', 'style'],
+    });
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1363,6 +1493,7 @@ jQuery(async () => {
     registerSlashCommands();
 
     watchExternalAvatarChanges();
+    watchAvatarRenders();
 
     eventSource.on(event_types.PERSONA_DELETED, onPersonaDeleted);
 
