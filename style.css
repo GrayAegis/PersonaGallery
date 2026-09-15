@@ -157,3 +157,64 @@
 .persona-gallery-popup .pg-lock.pg-lock-unavailable {
     opacity: 0.35;
 }
+
+/* Chat bar switcher. Size, opacity and hover come from SillyTavern's #leftSendForm > div rules. */
+#personaGallerySwitcher {
+    order: 11;
+}
+
+#personaGallerySwitcherMenu {
+    z-index: 30000;
+    backdrop-filter: blur(var(--SmartThemeBlurStrength));
+}
+
+#personaGallerySwitcherMenu ul {
+    margin: 0;
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 6px;
+    max-width: calc(5 * 54px + 30px);
+    max-height: 60vh;
+    max-height: 60svh;
+    overflow-y: auto;
+}
+
+#personaGallerySwitcherMenu li {
+    width: 48px;
+    height: 72px;
+    padding: 0;
+    border-radius: 6px;
+    cursor: pointer;
+}
+
+#personaGallerySwitcherMenu li img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    border-radius: 6px;
+    outline: 2px solid transparent;
+    outline-offset: 1px;
+}
+
+#personaGallerySwitcherMenu li:hover img,
+#personaGallerySwitcherMenu li:focus-visible img {
+    outline-color: var(--SmartThemeQuoteColor);
+}
+
+#personaGallerySwitcherMenu li.pg-switcher-active img {
+    outline-color: var(--golden);
+}
+
+#personaGallerySwitcherMenu li.pg-switcher-more {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.2em;
+    opacity: 0.7;
+}
+
+#personaGallerySwitcherMenu li.pg-switcher-more:hover {
+    opacity: 1;
+}

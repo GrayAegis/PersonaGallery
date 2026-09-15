@@ -21,6 +21,7 @@ import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
 import { ARGUMENT_TYPE, SlashCommandArgument } from '../../../slash-commands/SlashCommandArgument.js';
 import { SlashCommandEnumValue, enumTypes } from '../../../slash-commands/SlashCommandEnumValue.js';
 import { t } from '../../../i18n.js';
+import { Popper } from '../../../../lib.js';
 
 const MODULE_NAME = 'personaGallery';
 const FOLDER_PREFIX = 'persona-gallery';
@@ -60,6 +61,12 @@ let activeGallery = null;
 
 /** Set while an avatar is being written, so overlapping switches cannot interleave. */
 let applyInFlight = false;
+
+/** The chat bar image menu while it is open, or null. */
+let switcherPopper = null;
+
+/** Set while the chat bar menu is reading the gallery, so a double click opens one menu. */
+let switcherOpening = false;
 
 /** Avatars switched during this page load, each with a version stamped onto its URLs. */
 const avatarVersions = new Map();
@@ -1328,6 +1335,172 @@ async function onPromptReady(eventData) {
 }
 
 /* -------------------------------------------------------------------------- */
+/*                              Chat bar switcher                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Adds a button beside the message box that switches the persona's image from inside
+ * the chat, so the persona drawer never has to be opened.
+ */
+function addSwitcherButton() {
+    if (document.getElementById('personaGallerySwitcher')) {
+        return;
+    }
+
+    const form = document.getElementById('leftSendForm');
+
+    if (!form) {
+        return;
+    }
+
+    const button = document.createElement('div');
+    button.id = 'personaGallerySwitcher';
+    button.className = 'fa-solid fa-images interactable';
+    button.tabIndex = 0;
+    button.title = t`Switch persona image\n\nShift-click for the next image`;
+    button.setAttribute('role', 'button');
+    button.setAttribute('aria-label', t`Switch persona image`);
+    button.setAttribute('aria-haspopup', 'menu');
+    button.setAttribute('aria-expanded', 'false');
+
+    button.addEventListener('click', async event => {
+        if (event.shiftKey) {
+            closeSwitcher();
+            await cycleImage(user_avatar, 1);
+            return;
+        }
+
+        if (switcherPopper) {
+            closeSwitcher();
+            return;
+        }
+
+        await openSwitcher();
+    });
+
+    form.appendChild(button);
+}
+
+/**
+ * Opens a small menu of the current persona's images above the chat bar button.
+ */
+async function openSwitcher() {
+    const button = document.getElementById('personaGallerySwitcher');
+    const avatarId = user_avatar;
+
+    if (!button || switcherOpening) {
+        return;
+    }
+
+    if (!avatarId) {
+        toastr.warning(t`Select a persona first.`);
+        return;
+    }
+
+    switcherOpening = true;
+
+    try {
+        const images = await listGallery(avatarId);
+
+        if (!images) {
+            toastr.error(t`Could not read this persona's gallery.`);
+            return;
+        }
+
+        const meta = getMeta(avatarId);
+        const menu = document.createElement('div');
+        menu.id = 'personaGallerySwitcherMenu';
+
+        const list = document.createElement('ul');
+        list.className = 'list-group';
+        list.setAttribute('role', 'menu');
+        list.setAttribute('aria-label', t`Images for ${personaName(avatarId)}`);
+
+        for (const image of images) {
+            const name = image.label || image.file;
+            const item = document.createElement('li');
+            item.className = 'list-group-item interactable';
+            item.tabIndex = 0;
+            item.title = name;
+            item.setAttribute('role', 'menuitem');
+            item.setAttribute('aria-label', t`Use ${name}`);
+            item.classList.toggle('pg-switcher-active', meta.active === image.file);
+
+            const img = document.createElement('img');
+            img.src = image.url;
+            img.loading = 'lazy';
+            img.alt = name;
+            item.appendChild(img);
+
+            item.addEventListener('click', async () => {
+                closeSwitcher();
+
+                // Clicking the image already in use would rewrite the avatar for nothing.
+                if (getMeta(avatarId).active !== image.file) {
+                    await applyImage(avatarId, image);
+                }
+            });
+
+            list.appendChild(item);
+        }
+
+        const more = document.createElement('li');
+        more.className = 'list-group-item interactable pg-switcher-more fa-solid fa-ellipsis';
+        more.tabIndex = 0;
+        more.title = images.length ? t`Open the full gallery` : t`No images yet. Open the gallery to add some.`;
+        more.setAttribute('role', 'menuitem');
+        more.setAttribute('aria-label', t`Open the full gallery`);
+        more.addEventListener('click', async () => {
+            closeSwitcher();
+            await openGallery(avatarId);
+        });
+        list.appendChild(more);
+
+        menu.appendChild(list);
+        document.body.appendChild(menu);
+
+        switcherPopper = Popper.createPopper(button, menu, { placement: 'top-start' });
+        button.setAttribute('aria-expanded', 'true');
+    } finally {
+        switcherOpening = false;
+    }
+}
+
+/**
+ * Closes the chat bar menu if it is open.
+ */
+function closeSwitcher() {
+    switcherPopper?.destroy();
+    switcherPopper = null;
+    document.getElementById('personaGallerySwitcherMenu')?.remove();
+    document.getElementById('personaGallerySwitcher')?.setAttribute('aria-expanded', 'false');
+}
+
+/**
+ * Closes the menu on a click elsewhere or on Escape, the way SillyTavern's own menus behave.
+ */
+function watchSwitcherDismissal() {
+    document.addEventListener('pointerdown', event => {
+        if (!switcherPopper) {
+            return;
+        }
+
+        const target = /** @type {Element} */ (event.target);
+
+        if (!target.closest?.('#personaGallerySwitcherMenu, #personaGallerySwitcher')) {
+            closeSwitcher();
+        }
+    }, true);
+
+    document.addEventListener('keydown', event => {
+        if (switcherPopper && event.key === 'Escape') {
+            closeSwitcher();
+            document.getElementById('personaGallerySwitcher')?.focus();
+        }
+    });
+}
+
+/* -------------------------------------------------------------------------- */
 /*                              Slash commands                                */
 /* -------------------------------------------------------------------------- */
 
@@ -1614,6 +1787,8 @@ function onPersonaDeleted(data) {
 jQuery(async () => {
     getSettings();
     addToolbarButton();
+    addSwitcherButton();
+    watchSwitcherDismissal();
     addSettingsPanel();
     registerSlashCommands();
 
@@ -1629,6 +1804,10 @@ jQuery(async () => {
     // Opening a chat, or changing persona inside one, can pin a different image.
     eventSource.on(event_types.CHAT_CHANGED, () => applyLockedImage());
     eventSource.on(event_types.PERSONA_CHANGED, () => applyLockedImage());
+
+    // A menu listing the previous persona's images would switch the wrong one.
+    eventSource.on(event_types.CHAT_CHANGED, () => closeSwitcher());
+    eventSource.on(event_types.PERSONA_CHANGED, () => closeSwitcher());
 
     // GENERATION_STARTED fires earlier in the same Generate call with the type, which
     // the prompt-ready event does not carry. Dry runs never reach GENERATION_ENDED, so

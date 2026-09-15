@@ -18,6 +18,14 @@ picture-stack button.
 - **Click** it to open the gallery for the current persona.
 - **Shift-click** it to jump straight to the next image.
 
+There is also a picture-stack button beside the message box, next to Quick Persona if you use
+it, so you can switch without leaving the chat.
+
+- **Click** it for a small menu of the current persona's images. Pick one and it applies
+  immediately; the one in use is outlined in gold. The last entry opens the full gallery.
+- **Shift-click** it to jump straight to the next image.
+- Escape or a click anywhere else closes the menu.
+
 Inside the gallery:
 
 - Click a tile to make that image the persona's avatar. The current one is outlined in gold.
