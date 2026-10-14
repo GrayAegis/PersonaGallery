@@ -134,6 +134,11 @@
     color: var(--fullred);
 }
 
+/* Marks the images that already have a description stored. */
+.persona-gallery-popup .pg-describe.pg-described {
+    color: var(--SmartThemeQuoteColor);
+}
+
 .persona-gallery-popup .pg-hint {
     font-size: 0.85em;
 }

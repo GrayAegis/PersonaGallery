@@ -11,6 +11,7 @@ import {
 } from '../../../../script.js';
 import { isImageInliningSupported, oai_settings } from '../../../openai.js';
 import { extension_settings } from '../../../extensions.js';
+import { getMultimodalCaption } from '../../shared.js';
 import { user_avatar, getCurrentConnectionObj, getUserAvatar } from '../../../personas.js';
 import { power_user } from '../../../power-user.js';
 import { Popup, POPUP_TYPE, POPUP_RESULT } from '../../../popup.js';
@@ -43,7 +44,17 @@ const defaultSettings = {
     injectMax: 4,
     /** Longest edge, in pixels, of an image before it is sent. */
     injectMaxEdge: 1024,
+    /** Send a cached text description of each image instead of the image itself. */
+    injectAsDescription: false,
+    /** What the vision model is asked when it describes an image. */
+    describePrompt: '',
 };
+
+/** Used when the description prompt setting is left empty. */
+const DEFAULT_DESCRIBE_PROMPT = 'Describe the person in this image for a novelist who cannot see it. Cover physical build, face, hair, eye colour, skin, clothing, and anything they are holding or wearing that stands out. Plain prose, 80-150 words. No names, no guesses about personality or mood, no description of art style, no preamble.';
+
+/** Popup result for the re-describe button in the description editor. */
+const RESULT_REDESCRIBE = 1001;
 
 /** Sanitized folder names, keyed by avatar id, so we don't re-ask the server on every render. */
 const folderNameCache = new Map();
@@ -78,6 +89,16 @@ const encodedImages = new Map();
 let warnedAboutVision = false;
 
 /**
+ * Descriptions being written right now, keyed by gallery path. A send and an immediate
+ * swipe both ask for the same image; the second waits on the first instead of paying twice.
+ * @type {Map<string, Promise<string>>}
+ */
+const describesInFlight = new Map();
+
+/** Whether a failed description has already been reported during a generation this session. */
+let warnedAboutDescriptions = false;
+
+/**
  * Type of the generation SillyTavern is currently building, or null between them.
  * Quiet generations are background calls made by other extensions: summarisers,
  * expression classifiers, captioners. They should not be paying for reference images.
@@ -89,6 +110,14 @@ let currentGenerationType = null;
  * @property {string} file File name inside the gallery folder.
  * @property {string} url Path relative to the user data root.
  * @property {string} label Human-readable label, or an empty string.
+ */
+
+/**
+ * @typedef {object} ImageDescription
+ * @property {string} text What is sent in place of the image.
+ * @property {string} model The captioning API and model that wrote it, as `api/model`.
+ * @property {number} at When it was written or last edited, in milliseconds.
+ * @property {boolean} [edited] Set once the text has been corrected by hand.
  */
 
 /* -------------------------------------------------------------------------- */
@@ -123,7 +152,7 @@ function getMeta(avatarId) {
     const settings = getSettings();
 
     if (!settings.meta[avatarId]) {
-        settings.meta[avatarId] = { active: null, labels: {}, locks: {}, fallback: null, imported: false };
+        settings.meta[avatarId] = { active: null, labels: {}, locks: {}, descriptions: {}, fallback: null, imported: false };
     }
 
     const meta = settings.meta[avatarId];
@@ -134,6 +163,10 @@ function getMeta(avatarId) {
 
     if (!meta.locks || typeof meta.locks !== 'object') {
         meta.locks = {};
+    }
+
+    if (!meta.descriptions || typeof meta.descriptions !== 'object') {
+        meta.descriptions = {};
     }
 
     return meta;
@@ -202,11 +235,14 @@ async function listGallery(avatarId, { fresh = false } = {}) {
         const files = await response.json();
         const folder = await resolveFolderName(avatarId);
 
-        // Files can be removed from the folder by hand, so drop labels that no longer point anywhere.
-        const orphans = Object.keys(meta.labels).filter(file => !files.includes(file));
+        // Files can be removed from the folder by hand, so drop labels and descriptions
+        // that no longer point anywhere.
+        const orphanLabels = Object.keys(meta.labels).filter(file => !files.includes(file));
+        const orphanDescriptions = Object.keys(meta.descriptions).filter(file => !files.includes(file));
 
-        if (orphans.length) {
-            orphans.forEach(file => delete meta.labels[file]);
+        if (orphanLabels.length || orphanDescriptions.length) {
+            orphanLabels.forEach(file => delete meta.labels[file]);
+            orphanDescriptions.forEach(file => delete meta.descriptions[file]);
             saveSettingsDebounced();
         }
 
@@ -326,6 +362,7 @@ async function deleteImage(avatarId, image) {
 
     const meta = getMeta(avatarId);
     delete meta.labels[image.file];
+    delete meta.descriptions[image.file];
 
     if (meta.active === image.file) {
         meta.active = null;
@@ -906,6 +943,9 @@ async function renderGallery(container, avatarId) {
         header.src = getThumbnailUrl('persona', avatarId, true);
     }
 
+    const describeMode = isDescriptionMode();
+    container.querySelector('.pg-describe-all')?.classList.toggle('displayNone', !describeMode);
+
     grid.innerHTML = '';
     grid.classList.add('pg-loading');
 
@@ -965,6 +1005,17 @@ async function renderGallery(container, avatarId) {
         const actions = document.createElement('div');
         actions.classList.add('pg-actions');
 
+        if (describeMode) {
+            const described = !!meta.descriptions[image.file]?.text;
+            const describe = document.createElement('i');
+            describe.className = 'fa-solid fa-align-left pg-action pg-describe interactable';
+            describe.classList.toggle('pg-described', described);
+            describe.title = described ? t`Read or edit the description` : t`Describe this image`;
+            describe.setAttribute('role', 'button');
+            describe.setAttribute('aria-label', t`Description of ${image.label || image.file}`);
+            actions.appendChild(describe);
+        }
+
         const rename = document.createElement('i');
         rename.className = 'fa-solid fa-tag pg-action pg-rename interactable';
         rename.title = t`Set a label`;
@@ -1021,6 +1072,17 @@ function renderLockRow(container, avatarId) {
 async function onTileClick(event, container, avatarId, image) {
     const target = /** @type {HTMLElement} */ (event.target);
 
+    if (target.classList.contains('pg-describe')) {
+        event.stopPropagation();
+        await openDescriptionEditor(avatarId, image);
+
+        if (activeGallery?.container === container) {
+            await renderGallery(container, avatarId);
+        }
+
+        return;
+    }
+
     if (target.classList.contains('pg-rename')) {
         event.stopPropagation();
         const value = await Popup.show.input(t`Label for this image`, null, image.label);
@@ -1067,6 +1129,165 @@ async function onTileClick(event, container, avatarId, image) {
 }
 
 /**
+ * Describes one image from the gallery, keeping the user informed, since a vision call
+ * can take several seconds.
+ * @param {string} avatarId
+ * @param {GalleryImage} image
+ * @param {boolean} force
+ * @returns {Promise<boolean>} Whether a description is now stored.
+ */
+async function describeWithFeedback(avatarId, image, force) {
+    const problem = getDescribeSetupProblem();
+
+    if (problem) {
+        toastr.warning(problem);
+        return false;
+    }
+
+    const pending = toastr.info(t`Describing ${image.label || image.file}…`, '', { timeOut: 0, extendedTimeOut: 0 });
+
+    try {
+        await describeImage(avatarId, image, { force });
+        return true;
+    } catch (error) {
+        console.error('[Persona Gallery] Could not describe an image', error);
+        toastr.error(String(error?.message || error), t`Could not describe the image`);
+        return false;
+    } finally {
+        toastr.clear(pending);
+    }
+}
+
+/**
+ * Shows an image's description for reading and correcting, describing it first if it
+ * has none. The vision model's take is a starting point; the user knows the persona.
+ * @param {string} avatarId
+ * @param {GalleryImage} image
+ */
+async function openDescriptionEditor(avatarId, image) {
+    if (!getMeta(avatarId).descriptions[image.file]?.text) {
+        if (!await describeWithFeedback(avatarId, image, false)) {
+            return;
+        }
+    }
+
+    // Re-describing reopens the editor with the new text, so the loop ends on save or cancel.
+    while (true) {
+        const entry = getSettings().meta[avatarId]?.descriptions?.[image.file];
+
+        if (!entry?.text) {
+            return;
+        }
+
+        // Built from nodes, not markup: the label is user text and must not be parsed as HTML.
+        const content = document.createElement('div');
+        const heading = document.createElement('h3');
+        heading.textContent = image.label ? t`Description of ${image.label}` : t`Image description`;
+        const source = document.createElement('small');
+        source.classList.add('opacity50p');
+        const when = new Date(entry.at).toLocaleString();
+        source.textContent = entry.edited
+            ? t`Written by ${entry.model}, edited ${when}. Sent in place of the image.`
+            : t`Written by ${entry.model}, ${when}. Sent in place of the image.`;
+        content.append(heading, source);
+
+        const popup = new Popup(content, POPUP_TYPE.INPUT, entry.text, {
+            rows: 10,
+            wide: true,
+            okButton: t`Save`,
+            cancelButton: t`Cancel`,
+            customButtons: [{ text: t`Describe again`, icon: 'fa-rotate', result: RESULT_REDESCRIBE }],
+        });
+
+        await popup.show();
+
+        if (popup.result === RESULT_REDESCRIBE) {
+            await describeWithFeedback(avatarId, image, true);
+            continue;
+        }
+
+        if (popup.result !== POPUP_RESULT.AFFIRMATIVE) {
+            return;
+        }
+
+        // The persona may have been deleted while the editor was open; don't revive it.
+        const meta = getSettings().meta[avatarId];
+
+        if (!meta?.descriptions) {
+            return;
+        }
+
+        const text = String(popup.value ?? '').trim();
+
+        if (text) {
+            meta.descriptions[image.file] = { ...entry, text, at: Date.now(), edited: true };
+        } else {
+            // An emptied description is cleared, and will be written again when next needed.
+            delete meta.descriptions[image.file];
+        }
+
+        saveSettingsDebounced();
+        return;
+    }
+}
+
+/**
+ * Describes every image in a persona's gallery that has no description yet.
+ * @param {string} avatarId
+ */
+async function describeAll(avatarId) {
+    const problem = getDescribeSetupProblem();
+
+    if (problem) {
+        toastr.warning(problem);
+        return;
+    }
+
+    const images = await listGallery(avatarId);
+
+    if (!images) {
+        toastr.error(t`Could not read this persona's gallery.`);
+        return;
+    }
+
+    const descriptions = getMeta(avatarId).descriptions;
+    const missing = images.filter(image => !descriptions[image.file]?.text);
+
+    if (!missing.length) {
+        toastr.info(t`Every image already has a description.`);
+        return;
+    }
+
+    let done = 0;
+    let failed = 0;
+    const pending = toastr.info(
+        missing.length === 1 ? t`Describing 1 image…` : t`Describing ${missing.length} images…`,
+        '',
+        { timeOut: 0, extendedTimeOut: 0 },
+    );
+
+    try {
+        await runLimited(missing, 3, async image => {
+            try {
+                await describeImage(avatarId, image);
+                done++;
+            } catch (error) {
+                failed++;
+                console.error('[Persona Gallery] Could not describe', image.file, error);
+            }
+        });
+    } finally {
+        toastr.clear(pending);
+    }
+
+    if (failed) {
+        toastr.warning(t`Described ${done} of ${missing.length} images. The rest failed; the browser console has the reason.`);
+    } else {
+        toastr.success(done === 1 ? t`Described 1 image.` : t`Described ${done} images.`);
+    }
+}
+
+/**
  * Opens the gallery for a persona.
  * @param {string} avatarId
  */
@@ -1089,6 +1310,10 @@ async function openGallery(avatarId) {
             <div class="flex1 pg-heading">
                 <h3 class="margin0"></h3>
                 <small class="pg-count opacity50p"></small>
+            </div>
+            <div class="pg-describe-all menu_button menu_button_icon displayNone">
+                <i class="fa-solid fa-align-left"></i>
+                <span></span>
             </div>
             <div class="pg-add menu_button menu_button_icon">
                 <i class="fa-solid fa-plus"></i>
@@ -1113,6 +1338,8 @@ async function openGallery(avatarId) {
 
     container.querySelector('.pg-heading h3').textContent = personaName(avatarId);
     container.querySelector('.pg-add span').textContent = t`Add images`;
+    container.querySelector('.pg-describe-all span').textContent = t`Describe all`;
+    container.querySelector('.pg-describe-all').title = t`Describe every image that has no description yet`;
     container.querySelector('.pg-locks-label').textContent = t`Pin the current image to:`;
     container.querySelector('.pg-hint').textContent =
         t`Click an image to make it this persona's avatar. Drop image files here to add them.`;
@@ -1147,6 +1374,14 @@ async function openGallery(avatarId) {
     if (existing && !existing.length && !meta.imported && getSettings().autoImportCurrent) {
         await importCurrentAvatar(avatarId);
     }
+
+    container.querySelector('.pg-describe-all').addEventListener('click', async () => {
+        await describeAll(avatarId);
+
+        if (activeGallery?.container === container) {
+            await renderGallery(container, avatarId);
+        }
+    });
 
     container.querySelector('.pg-add').addEventListener('click', async () => {
         const files = await pickFiles();
@@ -1237,6 +1472,121 @@ async function encodeForPrompt(url) {
 }
 
 /**
+ * Whether descriptions are what this extension sends right now.
+ * Off whenever sending is off, so the toggle alone never changes anything.
+ */
+function isDescriptionMode() {
+    const settings = getSettings();
+    return settings.injectMode !== 'off' && !!settings.injectAsDescription;
+}
+
+/**
+ * Says why images cannot be described yet, or returns null when they can.
+ *
+ * The Image Captioning extension fills in OpenAI and a default model on load whether or
+ * not anyone has looked at its panel, so a set API and model prove nothing. Its source
+ * only reads 'multimodal' once someone has picked Multimodal there, and that is the one
+ * sign the vision model was chosen on purpose rather than left at a default.
+ * @returns {string|null}
+ */
+function getDescribeSetupProblem() {
+    const caption = extension_settings.caption;
+
+    if (caption?.source !== 'multimodal' || !caption.multimodal_api || !caption.multimodal_model) {
+        return t`Set Extensions → Image Captioning → Source to Multimodal and choose a vision model there first.`;
+    }
+
+    return null;
+}
+
+/**
+ * Asks the Image Captioning extension's vision model to describe a gallery image, and
+ * stores the text so the image is only paid for once.
+ * @param {string} avatarId
+ * @param {GalleryImage} image
+ * @param {object} [options]
+ * @param {boolean} [options.force=false] Describe it again even if a description is stored.
+ * @returns {Promise<string>} The description.
+ * @throws {Error} When captioning is not set up or the vision model fails.
+ */
+async function describeImage(avatarId, image, { force = false } = {}) {
+    const stored = getSettings().meta[avatarId]?.descriptions?.[image.file];
+
+    if (stored?.text && !force) {
+        return stored.text;
+    }
+
+    // A forced re-describe that lands on a pending one gets that result, which is just as new.
+    if (describesInFlight.has(image.url)) {
+        return describesInFlight.get(image.url);
+    }
+
+    const job = (async () => {
+        const problem = getDescribeSetupProblem();
+
+        if (problem) {
+            throw new Error(problem);
+        }
+
+        const dataUrl = await encodeForPrompt(image.url);
+
+        if (!dataUrl) {
+            throw new Error(t`Could not read ${image.label || image.file}.`);
+        }
+
+        // Read before the call, so the record names the model that actually wrote the text.
+        const caption = extension_settings.caption;
+        const model = `${caption.multimodal_api}/${caption.multimodal_model}`;
+        const prompt = String(getSettings().describePrompt || '').trim() || DEFAULT_DESCRIBE_PROMPT;
+        const text = String(await getMultimodalCaption(dataUrl, prompt) ?? '').trim();
+
+        if (!text) {
+            throw new Error(t`The vision model returned an empty description.`);
+        }
+
+        // Read the record without getMeta: if the persona was deleted while the model was
+        // working, getMeta would bring its metadata back. A file deleted in the meantime
+        // leaves an orphan here, which the next fresh listing clears like any other.
+        const meta = getSettings().meta[avatarId];
+
+        if (meta) {
+            meta.descriptions ??= {};
+            meta.descriptions[image.file] = { text, model, at: Date.now() };
+            saveSettingsDebounced();
+        }
+
+        return text;
+    })();
+
+    describesInFlight.set(image.url, job);
+
+    try {
+        return await job;
+    } finally {
+        describesInFlight.delete(image.url);
+    }
+}
+
+/**
+ * Runs a task over items with a few at a time in flight, so describing a large gallery
+ * does not fire every vision request at once and trip a provider's rate limit.
+ * @template T
+ * @param {T[]} items
+ * @param {number} limit
+ * @param {(item: T) => Promise<void>} task
+ */
+async function runLimited(items, limit, task) {
+    const queue = [...items];
+    const worker = async () => {
+        while (queue.length) {
+            await task(queue.shift());
+        }
+    };
+
+    await Promise.all(Array.from({ length: Math.min(limit, queue.length) }, worker));
+}
+
+/**
  * Which images this turn should carry.
  * @param {string} avatarId
  * @returns {Promise<GalleryImage[]>}
@@ -1279,7 +1629,10 @@ async function onPromptReady(eventData) {
         return;
     }
 
-    if (!isImageInliningSupported() && !warnedAboutVision) {
+    const describe = settings.injectAsDescription;
+
+    // Description mode sends only text, so the model needs no vision support.
+    if (!describe && !isImageInliningSupported() && !warnedAboutVision) {
         warnedAboutVision = true;
         console.warn('[Persona Gallery] Sending persona images, but SillyTavern does not list this model as vision capable. Turn image sending off if the API rejects the request.');
     }
@@ -1301,6 +1654,11 @@ async function onPromptReady(eventData) {
         ?? eventData.chat[eventData.chat.length - 1];
 
     if (!target) {
+        return;
+    }
+
+    if (describe) {
+        await appendDescriptions(target, images, avatarId, !!eventData.dryRun);
         return;
     }
 
@@ -1332,6 +1690,71 @@ async function onPromptReady(eventData) {
     if (sent) {
         console.debug(`[Persona Gallery] Sent ${sent} reference image(s) for ${name}.`);
     }
+}
+
+/**
+ * Adds the stored descriptions of the given images to a message, describing any that
+ * have none yet. Images that end up without a description are left out entirely: the
+ * model in this mode is likely text-only, so falling back to the image would break it.
+ * @param {{ content: string|object[] }} target The message to add to.
+ * @param {GalleryImage[]} images
+ * @param {string} avatarId
+ * @param {boolean} dryRun Token counts and previews: use stored text, never pay for new text.
+ */
+async function appendDescriptions(target, images, avatarId, dryRun) {
+    const descriptions = getMeta(avatarId).descriptions;
+
+    // In parallel, so the whole-gallery mode waits for the slowest image rather than the sum.
+    const texts = await Promise.all(images.map(async image => {
+        const stored = descriptions[image.file]?.text;
+
+        if (stored || dryRun) {
+            return stored || null;
+        }
+
+        try {
+            return await describeImage(avatarId, image);
+        } catch (error) {
+            console.warn('[Persona Gallery] Could not describe an image, so it was left out of the prompt.', error);
+
+            if (!warnedAboutDescriptions) {
+                warnedAboutDescriptions = true;
+                toastr.warning(String(error?.message || error), t`Persona Gallery could not describe an image`);
+            }
+
+            return null;
+        }
+    }));
+
+    const name = personaName(avatarId);
+    const lines = images
+        .map((image, index) => {
+            if (!texts[index]) {
+                return null;
+            }
+
+            const caption = image.label ? `${name}, ${image.label}` : name;
+            return `[Reference image of ${caption}: ${texts[index]}]`;
+        })
+        .filter(Boolean);
+
+    if (!lines.length) {
+        return;
+    }
+
+    const text = lines.join('\n\n');
+
+    // A string stays a string, so the request keeps the shape it would have without this
+    // extension. Some text-only providers handle the parts array badly.
+    if (typeof target.content === 'string') {
+        target.content = target.content ? `${target.content}\n\n${text}` : text;
+    } else if (Array.isArray(target.content)) {
+        target.content.push({ type: 'text', text });
+    } else {
+        return;
+    }
+
+    console.debug(`[Persona Gallery] Sent ${lines.length} image description(s) for ${name}.`);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1654,11 +2077,27 @@ function addSettingsPanel() {
                     <option value="active">The image currently applied</option>
                     <option value="all">The whole gallery</option>
                 </select>
+                <label class="checkbox_label" for="pg_inject_describe" id="pg_inject_describe_row">
+                    <input id="pg_inject_describe" type="checkbox">
+                    <span>Describe images instead of sending them</span>
+                </label>
+                <div id="pg_describe_options">
+                    <div class="opacity50p">
+                        Uses the vision model set in Extensions → Image Captioning, with its Source
+                        set to Multimodal. Each image is described once, and the text is sent on
+                        every request. Read, edit or redo a description from the gallery.
+                    </div>
+                    <label for="pg_describe_prompt">Description prompt</label>
+                    <textarea id="pg_describe_prompt" class="text_pole textarea_compact" rows="5"></textarea>
+                    <div class="opacity50p">
+                        Leave empty for the default. A new prompt is used for new descriptions only.
+                    </div>
+                </div>
                 <label for="pg_inject_max">Most images to send at once</label>
                 <input id="pg_inject_max" class="text_pole" type="number" min="1" max="20" step="1">
                 <label for="pg_inject_edge">Longest edge of a sent image, in pixels</label>
                 <input id="pg_inject_edge" class="text_pole" type="number" min="256" max="4096" step="64">
-                <div class="opacity50p marginTop10">
+                <div id="pg_inject_vision_hint" class="opacity50p marginTop10">
                     Sending needs a Chat Completion API and a model that accepts images. Each
                     one is shrunk and attached to your latest message, labelled with its gallery
                     name, on every request.
@@ -1679,6 +2118,11 @@ function addSettingsPanel() {
     const injectMode = /** @type {HTMLSelectElement} */ (document.getElementById('pg_inject_mode'));
     const injectMax = /** @type {HTMLInputElement} */ (document.getElementById('pg_inject_max'));
     const injectEdge = /** @type {HTMLInputElement} */ (document.getElementById('pg_inject_edge'));
+    const injectDescribe = /** @type {HTMLInputElement} */ (document.getElementById('pg_inject_describe'));
+    const describeRow = document.getElementById('pg_inject_describe_row');
+    const describeOptions = document.getElementById('pg_describe_options');
+    const describePrompt = /** @type {HTMLTextAreaElement} */ (document.getElementById('pg_describe_prompt'));
+    const visionHint = document.getElementById('pg_inject_vision_hint');
 
     autoImport.checked = settings.autoImportCurrent;
     confirmDelete.checked = settings.confirmDelete;
@@ -1686,6 +2130,9 @@ function addSettingsPanel() {
     injectMode.value = settings.injectMode;
     injectMax.value = String(settings.injectMax);
     injectEdge.value = String(settings.injectMaxEdge);
+    injectDescribe.checked = !!settings.injectAsDescription;
+    describePrompt.value = settings.describePrompt;
+    describePrompt.placeholder = DEFAULT_DESCRIBE_PROMPT;
 
     const showControl = (control, visible) => {
         control.classList.toggle('displayNone', !visible);
@@ -1694,7 +2141,11 @@ function addSettingsPanel() {
 
     const syncInjectVisibility = () => {
         showControl(injectMax, injectMode.value === 'all');
+        // The edge stays visible in description mode: it sizes the image sent to the captioner.
         showControl(injectEdge, injectMode.value !== 'off');
+        describeRow.classList.toggle('displayNone', injectMode.value === 'off');
+        describeOptions.classList.toggle('displayNone', injectMode.value === 'off' || !injectDescribe.checked);
+        visionHint.classList.toggle('displayNone', injectMode.value !== 'off' && injectDescribe.checked);
     };
 
     syncInjectVisibility();
@@ -1702,6 +2153,19 @@ function addSettingsPanel() {
     injectMode.addEventListener('change', () => {
         getSettings().injectMode = injectMode.value;
         syncInjectVisibility();
+        saveSettingsDebounced();
+    });
+
+    injectDescribe.addEventListener('change', () => {
+        getSettings().injectAsDescription = injectDescribe.checked;
+        // A fresh start for the once-per-session warning, now that the user is looking.
+        warnedAboutDescriptions = false;
+        syncInjectVisibility();
+        saveSettingsDebounced();
+    });
+
+    describePrompt.addEventListener('input', () => {
+        getSettings().describePrompt = describePrompt.value;
         saveSettingsDebounced();
     });
 

@@ -101,14 +101,39 @@ things that touch a finished prompt, so the inspector sees the images rather tha
 it stood beforehand. The browser console also logs a line for each request saying how many
 reference images were attached.
 
+### Sending descriptions instead
+
+A text-only model can still be told what your persona looks like. With sending on, tick
+**Describe images instead of sending them**. Each image is then described once by a vision
+model, the text is stored, and that text goes out on every request in place of the image. You
+pay for the image once rather than on every turn, and the roleplay model needs no vision
+support at all.
+
+The vision model is the one set in **Extensions → Image Captioning**. Set its **Source** to
+**Multimodal** and choose an API and model there; Persona Gallery will not describe anything
+until you do, because that extension otherwise sits on defaults nobody chose. The
+**Description prompt** setting is what the vision model is asked. Leave it empty for a prompt
+that asks for build, face, hair, eyes, skin, clothing and anything notable, in plain prose.
+
+Descriptions are written the first time a request needs them, which makes that one request
+slower. To avoid the wait, use **Describe all** in the gallery, or the description button on a
+single image. That same button opens the stored text for reading and correcting, since a
+vision model will sometimes get a detail wrong; **Describe again** asks for a fresh one, and
+saving an empty description clears it.
+
+Each description is added as plain text to your most recent message, in the form
+`[Reference image of <persona>, <label>: <description>]`. If an image cannot be described, it is
+left out of that request rather than sent as an image, and a warning shows once per session.
+Token counts and other dry runs use stored descriptions but never ask for new ones.
+
 ## Where things are stored
 
 Images go in your user data folder under `user/images/persona-gallery-<avatar file name>/`.
-You can drop files in there by hand and they show up in the gallery. Labels and the record of
-which image is active live in `settings.json` under `extension_settings.personaGallery`, so
-they travel with a settings backup.
+You can drop files in there by hand and they show up in the gallery. Labels, descriptions and the
+record of which image is active live in `settings.json` under
+`extension_settings.personaGallery`, so they travel with a settings backup.
 
-Deleting a persona in SillyTavern clears its labels but leaves the image folder, so nothing is
+Deleting a persona in SillyTavern clears its labels and descriptions but leaves the image folder, so nothing is
 lost by accident. Delete the folder yourself if you want the files gone.
 
 ## Things worth knowing
