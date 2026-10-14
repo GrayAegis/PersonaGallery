@@ -56,6 +56,9 @@ const DEFAULT_DESCRIBE_PROMPT = 'Describe the person in this image for a novelis
 /** Popup result for the re-describe button in the description editor. */
 const RESULT_REDESCRIBE = 1001;
 
+/** Macro that puts descriptions where the user writes it, rather than on the last user message. */
+const LOOK_MACRO = 'galleryLook';
+
 /** Sanitized folder names, keyed by avatar id, so we don't re-ask the server on every render. */
 const folderNameCache = new Map();
 
@@ -104,6 +107,13 @@ let warnedAboutDescriptions = false;
  * expression classifiers, captioners. They should not be paying for reference images.
  */
 let currentGenerationType = null;
+
+/**
+ * What the look macro last rendered, or null. The prompt hook looks for this text in the
+ * finished prompt: the macro can render inside a disabled prompt and never be sent, so
+ * having run proves nothing.
+ */
+let renderedLook = null;
 
 /**
  * @typedef {object} GalleryImage
@@ -254,6 +264,25 @@ async function listGallery(avatarId, { fresh = false } = {}) {
         galleryListings.set(avatarId, listing);
     }
 
+    return imagesFromListing(listing, meta);
+}
+
+/**
+ * The gallery as last listed, without asking the server, for code that cannot wait.
+ * @param {string} avatarId
+ * @returns {GalleryImage[]|null} The images, or null if the folder has not been listed yet.
+ */
+function getCachedGallery(avatarId) {
+    const listing = galleryListings.get(avatarId);
+    return listing ? imagesFromListing(listing, getMeta(avatarId)) : null;
+}
+
+/**
+ * @param {{ files: string[], folder: string }} listing
+ * @param {{ labels: Record<string, string> }} meta
+ * @returns {GalleryImage[]}
+ */
+function imagesFromListing(listing, meta) {
     // Labels are read live so a rename shows without another request.
     return listing.files.map(file => ({
         file: file,
@@ -1592,8 +1621,17 @@ async function runLimited(items, limit, task) {
  * @returns {Promise<GalleryImage[]>}
  */
 async function getImagesToSend(avatarId) {
+    return pickImagesToSend(avatarId, await listGallery(avatarId));
+}
+
+/**
+ * Picks this turn's images out of a gallery listing, by the send setting.
+ * @param {string} avatarId
+ * @param {GalleryImage[]|null} images
+ * @returns {GalleryImage[]}
+ */
+function pickImagesToSend(avatarId, images) {
     const settings = getSettings();
-    const images = await listGallery(avatarId);
 
     if (!images?.length) {
         return [];
@@ -1640,6 +1678,11 @@ async function onPromptReady(eventData) {
     const avatarId = user_avatar;
 
     if (!avatarId) {
+        return;
+    }
+
+    if (describe && renderedLook && promptIncludes(eventData.chat, renderedLook)) {
+        console.debug(`[Persona Gallery] Image descriptions went out through {{${LOOK_MACRO}}}.`);
         return;
     }
 
@@ -1702,10 +1745,38 @@ async function onPromptReady(eventData) {
  * @param {boolean} dryRun Token counts and previews: use stored text, never pay for new text.
  */
 async function appendDescriptions(target, images, avatarId, dryRun) {
+    const texts = await collectDescriptions(images, avatarId, dryRun);
+    const text = formatDescriptions(avatarId, images, texts);
+
+    if (!text) {
+        return;
+    }
+
+    // A string stays a string, so the request keeps the shape it would have without this
+    // extension. Some text-only providers handle the parts array badly.
+    if (typeof target.content === 'string') {
+        target.content = target.content ? `${target.content}\n\n${text}` : text;
+    } else if (Array.isArray(target.content)) {
+        target.content.push({ type: 'text', text });
+    } else {
+        return;
+    }
+
+    console.debug(`[Persona Gallery] Sent ${texts.filter(Boolean).length} image description(s) for ${personaName(avatarId)}.`);
+}
+
+/**
+ * Finds the stored description of each image, describing any that have none yet.
+ * @param {GalleryImage[]} images
+ * @param {string} avatarId
+ * @param {boolean} dryRun Use stored text only, never pay for new text.
+ * @returns {Promise<(string|null)[]>} One entry per image, null where there is no description.
+ */
+async function collectDescriptions(images, avatarId, dryRun) {
     const descriptions = getMeta(avatarId).descriptions;
 
     // In parallel, so the whole-gallery mode waits for the slowest image rather than the sum.
-    const texts = await Promise.all(images.map(async image => {
+    return await Promise.all(images.map(async image => {
         const stored = descriptions[image.file]?.text;
 
         if (stored || dryRun) {
@@ -1725,9 +1796,19 @@ async function appendDescriptions(target, images, avatarId, dryRun) {
             return null;
         }
     }));
+}
 
+/**
+ * The text that stands in for the images: one labelled line per described image.
+ * @param {string} avatarId
+ * @param {GalleryImage[]} images
+ * @param {(string|null)[]} texts One per image, null to leave that image out.
+ * @returns {string} Empty when no image has a description.
+ */
+function formatDescriptions(avatarId, images, texts) {
     const name = personaName(avatarId);
-    const lines = images
+
+    return images
         .map((image, index) => {
             if (!texts[index]) {
                 return null;
@@ -1736,25 +1817,105 @@ async function appendDescriptions(target, images, avatarId, dryRun) {
             const caption = image.label ? `${name}, ${image.label}` : name;
             return `[Reference image of ${caption}: ${texts[index]}]`;
         })
-        .filter(Boolean);
+        .filter(Boolean)
+        .join('\n\n');
+}
 
-    if (!lines.length) {
+/**
+ * Whether a finished prompt contains some text anywhere. Whitespace is compared loosely,
+ * because SillyTavern can collapse blank lines and trim prompts on the way.
+ * @param {object[]} messages
+ * @param {string} text
+ */
+function promptIncludes(messages, text) {
+    const squash = value => String(value).replace(/\s+/g, ' ').trim();
+    const needle = squash(text);
+
+    return messages.some(message => {
+        const content = Array.isArray(message?.content)
+            ? message.content.filter(part => part?.type === 'text').map(part => part.text).join(' ')
+            : message?.content;
+
+        return typeof content === 'string' && squash(content).includes(needle);
+    });
+}
+
+/**
+ * Renders the look macro: the stored descriptions of the images this turn would send.
+ * Macros cannot wait, so this reads the cached listing and stored text only; the
+ * generation hook fills both in beforehand.
+ * @returns {string}
+ */
+function renderLook() {
+    const avatarId = user_avatar;
+
+    if (!isDescriptionMode() || !avatarId) {
+        return '';
+    }
+
+    const images = pickImagesToSend(avatarId, getCachedGallery(avatarId));
+    const descriptions = images.length ? getMeta(avatarId).descriptions : {};
+    const text = formatDescriptions(avatarId, images, images.map(image => descriptions[image.file]?.text || null));
+
+    renderedLook = text || null;
+    return text;
+}
+
+/** Whether the current persona's description asks for the look macro. */
+function personaUsesLook() {
+    return new RegExp(`\\{\\{\\s*${LOOK_MACRO}\\s*\\}\\}`, 'i').test(power_user.persona_description || '');
+}
+
+/**
+ * Gets descriptions ready before the prompt is built, since the look macro renders while
+ * it is being built and cannot wait on a vision model.
+ * @param {string} type
+ * @param {object} _options
+ * @param {boolean} dryRun
+ */
+async function onGenerationStarted(type, _options, dryRun) {
+    currentGenerationType = type;
+    renderedLook = null;
+
+    const avatarId = user_avatar;
+
+    if (!isDescriptionMode() || !avatarId) {
         return;
     }
 
-    const text = lines.join('\n\n');
+    try {
+        // Listed even for dry runs, so a token count sees the same images a real send would.
+        const images = await getImagesToSend(avatarId);
 
-    // A string stays a string, so the request keeps the shape it would have without this
-    // extension. Some text-only providers handle the parts array badly.
-    if (typeof target.content === 'string') {
-        target.content = target.content ? `${target.content}\n\n${text}` : text;
-    } else if (Array.isArray(target.content)) {
-        target.content.push({ type: 'text', text });
-    } else {
-        return;
+        // Text completion only sends descriptions through the macro, so without it there
+        // is nothing to pay for.
+        if (dryRun || type === 'quiet' || !images.length || (main_api !== 'openai' && !personaUsesLook())) {
+            return;
+        }
+
+        await collectDescriptions(images, avatarId, false);
+    } catch (error) {
+        console.error('[Persona Gallery] Could not prepare image descriptions', error);
     }
+}
 
-    console.debug(`[Persona Gallery] Sent ${lines.length} image description(s) for ${name}.`);
+/**
+ * Registers the look macro with whichever macro engine SillyTavern is running. Read from
+ * the context rather than imported, so older versions without the new engine still load.
+ */
+function registerLookMacro() {
+    const { macros, registerMacro } = SillyTavern.getContext();
+    const description = 'Persona Gallery descriptions of the images that would be sent. Empty unless sending is on with Describe images instead of sending them ticked.';
+
+    if (power_user.experimental_macro_engine && macros?.register) {
+        macros.register(LOOK_MACRO, {
+            category: macros.category?.CHARACTER ?? 'character',
+            description,
+            handler: () => renderLook(),
+        });
+    } else if (typeof registerMacro === 'function') {
+        registerMacro(LOOK_MACRO, () => renderLook(), description);
+    }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2087,6 +2248,11 @@ function addSettingsPanel() {
                         set to Multimodal. Each image is described once, and the text is sent on
                         every request. Read, edit or redo a description from the gallery.
                     </div>
+                    <div class="opacity50p marginTop10">
+                        The text goes on your latest message. To send it somewhere else, put
+                        <code>{{galleryLook}}</code> in your persona description, or anywhere else
+                        in the prompt.
+                    </div>
                     <label for="pg_describe_prompt">Description prompt</label>
                     <textarea id="pg_describe_prompt" class="text_pole textarea_compact" rows="5"></textarea>
                     <div class="opacity50p">
@@ -2255,6 +2421,7 @@ jQuery(async () => {
     watchSwitcherDismissal();
     addSettingsPanel();
     registerSlashCommands();
+    registerLookMacro();
 
     watchExternalAvatarChanges();
     watchAvatarRenders();
@@ -2276,7 +2443,7 @@ jQuery(async () => {
     // GENERATION_STARTED fires earlier in the same Generate call with the type, which
     // the prompt-ready event does not carry. Dry runs never reach GENERATION_ENDED, so
     // the type is cleared again at the start of the next call rather than only at the end.
-    eventSource.on(event_types.GENERATION_STARTED, type => { currentGenerationType = type; });
+    eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
     eventSource.on(event_types.GENERATION_ENDED, () => { currentGenerationType = null; });
     eventSource.on(event_types.GENERATION_STOPPED, () => { currentGenerationType = null; });
 

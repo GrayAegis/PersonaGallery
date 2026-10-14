@@ -126,6 +126,33 @@ Each description is added as plain text to your most recent message, in the form
 left out of that request rather than sent as an image, and a warning shows once per session.
 Token counts and other dry runs use stored descriptions but never ask for new ones.
 
+### Placing descriptions with `{{galleryLook}}`
+
+Your most recent message is the last thing the model reads. That is a loud place for a
+paragraph about your persona's appearance, and some presets end the prompt with instructions
+that are meant to stay last. To put the descriptions somewhere else, write `{{galleryLook}}`
+where you want them. The usual place is the end of the persona's description in Persona
+Management, so the text goes wherever your preset puts your persona:
+
+```
+{{user}} is a courier who works the night routes.
+
+{{galleryLook}}
+```
+
+The macro renders the same text that would otherwise go on your message, for the same images.
+When that text reaches the prompt, nothing is added to your message. When it does not, because
+the macro is nowhere in the prompt or sits in a prompt that is switched off, the descriptions go
+on your message as before. The macro renders nothing while description mode is off. If your
+preset includes your persona description twice, the descriptions go out twice too.
+
+New descriptions are written before the prompt is built, so the macro has them on the request
+that first needs them. Because the macro is plain text, it also works with Text Completion
+backends, which cannot carry images. There, descriptions are only written ahead of time when the
+macro is in your persona description; if you put it anywhere else, use **Describe all** first.
+Background prompts that include your persona description carry the stored text too, but never
+ask for a new description.
+
 ## Where things are stored
 
 Images go in your user data folder under `user/images/persona-gallery-<avatar file name>/`.
