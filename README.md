@@ -33,6 +33,8 @@ Inside the gallery:
 - Each image is labelled with the file name it arrived under. The tag icon changes that label,
   and the label is what the slash commands match on.
 - The bin icon removes the image from the gallery folder without touching the persona.
+- The lines icon beside each label opens that image's description, which you can write yourself
+  or have a vision model write. See [Image descriptions](#image-descriptions).
 
 The first time you open a gallery for a persona, the avatar it already has is copied in as
 `Original`, so switching away from it is reversible. Any picture you later set with
@@ -61,7 +63,7 @@ Buttons are dimmed when they cannot be used, which means no image is applied yet
 no character or chat open to pin to.
 
 Everything in the gallery can be reached from the keyboard: Tab moves between tiles, their
-label and delete controls, and the pin buttons; Enter or Space activates whichever is focused.
+description, label and delete controls, and the pin buttons; Enter or Space activates whichever is focused.
 
 ## Slash commands
 
@@ -101,38 +103,33 @@ things that touch a finished prompt, so the inspector sees the images rather tha
 it stood beforehand. The browser console also logs a line for each request saying how many
 reference images were attached.
 
-### Sending descriptions instead
+## Image descriptions
 
-A text-only model can still be told what your persona looks like. With sending on, tick
-**Describe images instead of sending them**. Each image is then described once by a vision
-model, the text is stored, and that text goes out on every request in place of the image. You
-pay for the image once rather than on every turn, and the roleplay model needs no vision
-support at all.
+Each image can carry a written description of what it shows, which text-only models can use in
+place of the picture.
+
+### Writing a description
+
+Every image in the gallery has a lines icon at the right of its label. Click it to open that
+image's description. Type your own and **Save**, or click **Describe with vision model** to have
+one written and then correct anything it got wrong. Once a description exists the icon is lit,
+and clicking it opens the stored text for reading or editing. **Describe again** replaces it with
+a fresh one from the vision model, and saving an empty box clears it. The window says whether the
+text was written by hand or by a model, and when.
 
 The vision model is the one set in **Extensions → Image Captioning**. Set its **Source** to
-**Multimodal** and choose an API and model there; Persona Gallery will not describe anything
-until you do, because that extension otherwise sits on defaults nobody chose. The
-**Description prompt** setting is what the vision model is asked. Leave it empty for a prompt
-that asks for build, face, hair, eyes, skin, clothing and anything notable, in plain prose.
+**Multimodal** and choose an API and model there. Persona Gallery will not ask it for anything
+until you do, because that extension otherwise sits on defaults nobody chose. Writing by hand
+needs none of this. The **Description prompt** setting is what the vision model is asked; leave
+it empty for a prompt that asks for build, face, hair, eyes, skin, clothing and anything notable,
+in plain prose. Once a vision model is set up, **Describe all** at the top of the gallery fills in
+every image that has no description yet.
 
-Descriptions are written the first time a request needs them, which makes that one request
-slower. To avoid the wait, use **Describe all** in the gallery, or the description button on a
-single image. That same button opens the stored text for reading and correcting, since a
-vision model will sometimes get a detail wrong; **Describe again** asks for a fresh one, and
-saving an empty description clears it.
+### Sending descriptions with `{{galleryLook}}`
 
-Each description is added as plain text to your most recent message, in the form
-`[Reference image of <persona>, <label>: <description>]`. If an image cannot be described, it is
-left out of that request rather than sent as an image, and a warning shows once per session.
-Token counts and other dry runs use stored descriptions but never ask for new ones.
-
-### Placing descriptions with `{{galleryLook}}`
-
-Your most recent message is the last thing the model reads. That is a loud place for a
-paragraph about your persona's appearance, and some presets end the prompt with instructions
-that are meant to stay last. To put the descriptions somewhere else, write `{{galleryLook}}`
-where you want them. The usual place is the end of the persona's description in Persona
-Management, so the text goes wherever your preset puts your persona:
+Write `{{galleryLook}}` where you want the description to go. The usual place is the end of the
+persona's description in Persona Management, so the text goes wherever your preset puts your
+persona:
 
 ```
 {{user}} is a courier who works the night routes.
@@ -140,18 +137,37 @@ Management, so the text goes wherever your preset puts your persona:
 {{galleryLook}}
 ```
 
-The macro renders the same text that would otherwise go on your message, for the same images.
-When that text reaches the prompt, nothing is added to your message. When it does not, because
-the macro is nowhere in the prompt or sits in a prompt that is switched off, the descriptions go
-on your message as before. The macro renders nothing while description mode is off. If your
-preset includes your persona description twice, the descriptions go out twice too.
+The macro renders the description of the image currently applied, in the form
+`[Reference image of <persona>, <label>: <description>]`. With **Send images to the model** set
+to the whole gallery, it renders every image being sent instead, up to the cap. It works whatever
+that setting says, including **Do not send**: writing the macro is already the request. Images
+without a description are left out, so with none described it renders nothing. If your preset
+includes your persona description twice, the descriptions go out twice too.
 
-New descriptions are written before the prompt is built, so the macro has them on the request
-that first needs them. Because the macro is plain text, it also works with Text Completion
-backends, which cannot carry images. There, descriptions are only written ahead of time when the
-macro is in your persona description; if you put it anywhere else, use **Describe all** first.
-Background prompts that include your persona description carry the stored text too, but never
-ask for a new description.
+Because the macro is plain text, it also works with Text Completion backends, which cannot carry
+images. Background prompts that include your persona description carry it too.
+
+### Sending descriptions instead of images
+
+A text-only model can still be told what your persona looks like without you writing a word.
+With sending on, tick **Describe images instead of sending them**. Any image being sent that has
+no description is then described by the vision model, and the stored text goes out on every
+request in place of the image. You pay for the image once rather than on every turn, and the
+roleplay model needs no vision support. Descriptions you wrote yourself are used as they are.
+
+Missing descriptions are written when a request starts, which makes that one request slower. Use
+**Describe all** beforehand to avoid the wait. If an image cannot be described, it is left out of
+that request rather than sent as an image, and a warning shows once per session. Token counts and
+other dry runs use stored descriptions but never ask for new ones.
+
+The text goes through `{{galleryLook}}` when the macro is in the prompt. Otherwise it is added to
+your most recent message. That is the last thing the model reads, a loud place for a paragraph
+about your persona's appearance, and some presets end the prompt with instructions meant to stay
+last, so the macro is usually the better choice. Persona Gallery checks the finished prompt: if the
+macro's text is not in it, because the macro is nowhere in the prompt or sits in a prompt that is
+switched off, the descriptions go on your message instead. With Text Completion, descriptions are
+only written ahead of time when the macro is in your persona description; if you put it anywhere
+else, use **Describe all** first.
 
 ## Where things are stored
 

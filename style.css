@@ -87,13 +87,22 @@
     color: var(--black70a);
 }
 
+.persona-gallery-popup .pg-footer {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 2px 1px 6px;
+    background-color: var(--black70a);
+}
+
 .persona-gallery-popup .pg-label {
-    padding: 4px 6px;
+    flex: 1;
+    min-width: 0;
+    padding: 3px 0;
     font-size: 0.85em;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    background-color: var(--black70a);
 }
 
 .persona-gallery-popup .pg-label.pg-untitled {
@@ -134,8 +143,19 @@
     color: var(--fullred);
 }
 
+.persona-gallery-popup .pg-footer .pg-describe {
+    flex: 0 0 auto;
+    opacity: 0.5;
+    background-color: transparent;
+}
+
+.persona-gallery-popup .pg-footer .pg-describe:hover {
+    opacity: 1;
+}
+
 /* Marks the images that already have a description stored. */
 .persona-gallery-popup .pg-describe.pg-described {
+    opacity: 1;
     color: var(--SmartThemeQuoteColor);
 }
 

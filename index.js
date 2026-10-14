@@ -125,7 +125,8 @@ let renderedLook = null;
 /**
  * @typedef {object} ImageDescription
  * @property {string} text What is sent in place of the image.
- * @property {string} model The captioning API and model that wrote it, as `api/model`.
+ * @property {string} model The captioning API and model that wrote it, as `api/model`, or empty
+ * when the user wrote it.
  * @property {number} at When it was written or last edited, in milliseconds.
  * @property {boolean} [edited] Set once the text has been corrected by hand.
  */
@@ -972,8 +973,10 @@ async function renderGallery(container, avatarId) {
         header.src = getThumbnailUrl('persona', avatarId, true);
     }
 
-    const describeMode = isDescriptionMode();
-    container.querySelector('.pg-describe-all')?.classList.toggle('displayNone', !describeMode);
+    // Describe all needs the vision model, so it stays out of the way until one is set up,
+    // except in description mode, where clicking it explains what is missing.
+    const canDescribeAll = isDescriptionMode() || !getDescribeSetupProblem();
+    container.querySelector('.pg-describe-all')?.classList.toggle('displayNone', !canDescribeAll);
 
     grid.innerHTML = '';
     grid.classList.add('pg-loading');
@@ -1029,21 +1032,25 @@ async function renderGallery(container, avatarId) {
         label.classList.add('pg-label');
         label.textContent = image.label || t`Untitled`;
         label.classList.toggle('pg-untitled', !image.label);
-        tile.appendChild(label);
+
+        // On the label bar rather than with the hover actions, so it is always in view and
+        // shows at a glance which images have a description. Shown whatever the send
+        // setting, since {{galleryLook}} sends descriptions on its own.
+        const described = !!meta.descriptions[image.file]?.text;
+        const describe = document.createElement('i');
+        describe.className = 'fa-solid fa-align-left pg-action pg-describe interactable';
+        describe.classList.toggle('pg-described', described);
+        describe.title = described ? t`Read or edit the description` : t`Write or generate a description`;
+        describe.setAttribute('role', 'button');
+        describe.setAttribute('aria-label', t`Description of ${image.label || image.file}`);
+
+        const footer = document.createElement('div');
+        footer.classList.add('pg-footer');
+        footer.append(label, describe);
+        tile.appendChild(footer);
 
         const actions = document.createElement('div');
         actions.classList.add('pg-actions');
-
-        if (describeMode) {
-            const described = !!meta.descriptions[image.file]?.text;
-            const describe = document.createElement('i');
-            describe.className = 'fa-solid fa-align-left pg-action pg-describe interactable';
-            describe.classList.toggle('pg-described', described);
-            describe.title = described ? t`Read or edit the description` : t`Describe this image`;
-            describe.setAttribute('role', 'button');
-            describe.setAttribute('aria-label', t`Description of ${image.label || image.file}`);
-            actions.appendChild(describe);
-        }
 
         const rename = document.createElement('i');
         rename.className = 'fa-solid fa-tag pg-action pg-rename interactable';
@@ -1188,25 +1195,19 @@ async function describeWithFeedback(avatarId, image, force) {
 }
 
 /**
- * Shows an image's description for reading and correcting, describing it first if it
- * has none. The vision model's take is a starting point; the user knows the persona.
+ * Opens an image's description for writing by hand, or for asking the vision model and
+ * correcting what it says. Its take is only a starting point; the user knows the persona.
  * @param {string} avatarId
  * @param {GalleryImage} image
  */
 async function openDescriptionEditor(avatarId, image) {
-    if (!getMeta(avatarId).descriptions[image.file]?.text) {
-        if (!await describeWithFeedback(avatarId, image, false)) {
-            return;
-        }
-    }
+    // Unsaved typing, kept across a describe attempt that fails.
+    let draft = null;
 
-    // Re-describing reopens the editor with the new text, so the loop ends on save or cancel.
+    // Describing reopens the editor with the new text, so the loop ends on save or cancel.
     while (true) {
         const entry = getSettings().meta[avatarId]?.descriptions?.[image.file];
-
-        if (!entry?.text) {
-            return;
-        }
+        const stored = entry?.text || '';
 
         // Built from nodes, not markup: the label is user text and must not be parsed as HTML.
         const content = document.createElement('div');
@@ -1214,24 +1215,44 @@ async function openDescriptionEditor(avatarId, image) {
         heading.textContent = image.label ? t`Description of ${image.label}` : t`Image description`;
         const source = document.createElement('small');
         source.classList.add('opacity50p');
-        const when = new Date(entry.at).toLocaleString();
-        source.textContent = entry.edited
-            ? t`Written by ${entry.model}, edited ${when}. Sent in place of the image.`
-            : t`Written by ${entry.model}, ${when}. Sent in place of the image.`;
-        content.append(heading, source);
+        const when = stored ? new Date(entry.at).toLocaleString() : '';
 
-        const popup = new Popup(content, POPUP_TYPE.INPUT, entry.text, {
+        if (!stored) {
+            source.textContent = t`Write what this image shows, or ask the vision model set in Image Captioning.`;
+        } else if (!entry.model) {
+            source.textContent = t`Written by hand, ${when}.`;
+        } else {
+            source.textContent = entry.edited ? t`Written by ${entry.model}, edited ${when}.` : t`Written by ${entry.model}, ${when}.`;
+        }
+
+        const where = document.createElement('small');
+        where.classList.add('opacity50p');
+        where.textContent = isDescriptionMode()
+            ? t`Sent in place of the image, through {{galleryLook}} or on your latest message.`
+            : t`Sent wherever {{galleryLook}} appears in the prompt.`;
+        content.append(heading, source, document.createElement('br'), where);
+
+        const popup = new Popup(content, POPUP_TYPE.INPUT, draft ?? stored, {
             rows: 10,
             wide: true,
             okButton: t`Save`,
             cancelButton: t`Cancel`,
-            customButtons: [{ text: t`Describe again`, icon: 'fa-rotate', result: RESULT_REDESCRIBE }],
+            customButtons: [{
+                text: stored ? t`Describe again` : t`Describe with vision model`,
+                icon: stored ? 'fa-rotate' : 'fa-eye',
+                result: RESULT_REDESCRIBE,
+            }],
         });
 
         await popup.show();
 
         if (popup.result === RESULT_REDESCRIBE) {
-            await describeWithFeedback(avatarId, image, true);
+            draft = String(popup.value ?? '');
+
+            if (await describeWithFeedback(avatarId, image, true)) {
+                draft = null;
+            }
+
             continue;
         }
 
@@ -1248,11 +1269,18 @@ async function openDescriptionEditor(avatarId, image) {
 
         const text = String(popup.value ?? '').trim();
 
-        if (text) {
+        // Saving untouched text must not mark the vision model's description as edited.
+        if (text === stored.trim()) {
+            return;
+        }
+
+        if (!text) {
+            // In description mode, an emptied description is written again when next needed.
+            delete meta.descriptions[image.file];
+        } else if (entry?.model) {
             meta.descriptions[image.file] = { ...entry, text, at: Date.now(), edited: true };
         } else {
-            // An emptied description is cleared, and will be written again when next needed.
-            delete meta.descriptions[image.file];
+            meta.descriptions[image.file] = { text, model: '', at: Date.now() };
         }
 
         saveSettingsDebounced();
@@ -1841,15 +1869,16 @@ function promptIncludes(messages, text) {
 }
 
 /**
- * Renders the look macro: the stored descriptions of the images this turn would send.
- * Macros cannot wait, so this reads the cached listing and stored text only; the
- * generation hook fills both in beforehand.
+ * Renders the look macro: the stored descriptions of the images this turn would send, or
+ * of the applied image when sending is off. It works whatever the send setting, because
+ * writing the macro somewhere is already the request. Macros cannot wait, so this reads
+ * the cached listing and stored text only; the generation hook fills both in beforehand.
  * @returns {string}
  */
 function renderLook() {
     const avatarId = user_avatar;
 
-    if (!isDescriptionMode() || !avatarId) {
+    if (!avatarId) {
         return '';
     }
 
@@ -1879,17 +1908,19 @@ async function onGenerationStarted(type, _options, dryRun) {
 
     const avatarId = user_avatar;
 
-    if (!isDescriptionMode() || !avatarId) {
+    // Only personas that have a gallery; getMeta would start a record for any other.
+    if (!avatarId || !getSettings().meta[avatarId]) {
         return;
     }
 
     try {
-        // Listed even for dry runs, so a token count sees the same images a real send would.
+        // Listed for every generation, dry runs too, so the macro sees the same images a
+        // real send would. The listing is cached, so this asks the server once per persona.
         const images = await getImagesToSend(avatarId);
 
-        // Text completion only sends descriptions through the macro, so without it there
-        // is nothing to pay for.
-        if (dryRun || type === 'quiet' || !images.length || (main_api !== 'openai' && !personaUsesLook())) {
+        // New descriptions are only paid for in description mode. Text completion sends
+        // them only through the macro, so without it there is nothing to pay for.
+        if (!isDescriptionMode() || dryRun || type === 'quiet' || !images.length || (main_api !== 'openai' && !personaUsesLook())) {
             return;
         }
 
@@ -1905,7 +1936,7 @@ async function onGenerationStarted(type, _options, dryRun) {
  */
 function registerLookMacro() {
     const { macros, registerMacro } = SillyTavern.getContext();
-    const description = 'Persona Gallery descriptions of the images that would be sent. Empty unless sending is on with Describe images instead of sending them ticked.';
+    const description = 'Persona Gallery descriptions of the applied image, or of every image being sent. Write them from the gallery.';
 
     if (power_user.experimental_macro_engine && macros?.register) {
         macros.register(LOOK_MACRO, {
@@ -2267,6 +2298,12 @@ function addSettingsPanel() {
                     Sending needs a Chat Completion API and a model that accepts images. Each
                     one is shrunk and attached to your latest message, labelled with its gallery
                     name, on every request.
+                </div>
+                <div class="opacity50p marginTop10">
+                    Each image in the gallery has a description button for writing one by hand
+                    or asking a vision model. Put <code>{{galleryLook}}</code> in a persona
+                    description to send the applied image's description there, whatever is
+                    picked above.
                 </div>
                 <div class="opacity50p marginTop10">
                     Images are stored in the user data folder, under
