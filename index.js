@@ -1,4 +1,5 @@
 import {
+    chat,
     chat_metadata,
     eventSource,
     event_types,
@@ -6,6 +7,7 @@ import {
     getRequestHeaders,
     getThumbnailUrl,
     main_api,
+    saveChatDebounced,
     saveMetadata,
     saveSettingsDebounced,
 } from '../../../../script.js';
@@ -31,6 +33,9 @@ const ALLOWED_EXTENSIONS = ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'jfif'];
 /** Where a chat's pinned image is recorded, alongside SillyTavern's own chat metadata. */
 const CHAT_LOCK_KEY = 'personaGalleryImage';
 
+/** Where a message records the gallery image its persona had when it was sent, in its `extra`. */
+const MESSAGE_IMAGE_KEY = 'personaGalleryImage';
+
 const defaultSettings = {
     /** Copy the persona's existing avatar into the gallery the first time it is opened. */
     autoImportCurrent: true,
@@ -48,6 +53,8 @@ const defaultSettings = {
     injectAsDescription: false,
     /** What the vision model is asked when it describes an image. */
     describePrompt: '',
+    /** Each message you send keeps showing the image your persona had at the time. */
+    messageImages: true,
 };
 
 /** Used when the description prompt setting is left empty. */
@@ -55,6 +62,9 @@ const DEFAULT_DESCRIBE_PROMPT = 'Describe the person in this image for a novelis
 
 /** Popup result for the re-describe button in the description editor. */
 const RESULT_REDESCRIBE = 1001;
+
+/** Popup result for the button that lets a message follow the persona's current image again. */
+const RESULT_CLEAR_MESSAGE_IMAGE = 1002;
 
 /** Macro that puts descriptions where the user writes it, rather than on the last user message. */
 const LOOK_MACRO = 'galleryLook';
@@ -84,6 +94,12 @@ let switcherOpening = false;
 
 /** Avatars switched during this page load, each with a version stamped onto its URLs. */
 const avatarVersions = new Map();
+
+/** Whether any message in the open chat records an image, so its avatar needs swapping. */
+let messageImagesInChat = false;
+
+/** Recorded message images that failed to load, by path, so they are not tried again. */
+const brokenMessageImages = new Set();
 
 /** Downscaled data URLs, keyed by gallery path. Gallery files never change in place. */
 const encodedImages = new Map();
@@ -559,6 +575,70 @@ function versionedAvatarUrl(raw) {
 }
 
 /**
+ * A URL's path, decoded, for comparing URLs written in different ways.
+ * @param {string} raw
+ * @returns {string|null}
+ */
+function urlPath(raw) {
+    try {
+        return decodeURIComponent(new URL(raw, window.location.href).pathname);
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Whether a URL points at an image inside a persona gallery folder.
+ * @param {string} raw
+ */
+function isGalleryUrl(raw) {
+    return !!urlPath(raw)?.includes(`/user/images/${FOLDER_PREFIX}-`);
+}
+
+/**
+ * The chat message a persona avatar on screen belongs to, or null for anything that is
+ * not the avatar of a message you sent.
+ * @param {Element} element
+ */
+function chatMessageFor(element) {
+    const mes = element.closest?.('.mes[is_user="true"]');
+
+    if (!mes || element.closest('.mes_text, .mes_reasoning')) {
+        return null;
+    }
+
+    const id = Number(mes.getAttribute('mesid'));
+    return Number.isInteger(id) ? chat[id] ?? null : null;
+}
+
+/**
+ * What an avatar URL on screen should be, or null if it needs no change: the image its
+ * message recorded, or else the avatar's current version.
+ * @param {string} raw
+ * @param {Element} element
+ */
+function displayAvatarUrl(raw, element) {
+    const message = chatMessageFor(element);
+    const gallery = message && isGalleryUrl(raw);
+
+    if (message && (gallery || parsePersonaAvatarUrl(raw))) {
+        const record = getMessageImage(message);
+
+        if (record) {
+            return urlPath(raw) === urlPath(record.url) ? null : record.url;
+        }
+
+        // The record was cleared, failed to load or no longer applies: back to the avatar.
+        if (gallery) {
+            const avatar = message.force_avatar || getThumbnailUrl('persona', user_avatar);
+            return versionedAvatarUrl(avatar) ?? avatar;
+        }
+    }
+
+    return versionedAvatarUrl(raw);
+}
+
+/**
  * Updates one element: an image source, and any avatar URLs held in inline styles.
  * Themes such as Moonlit Echoes paint avatars as CSS backgrounds from custom
  * properties, which an image-only refresh never reaches.
@@ -566,7 +646,7 @@ function versionedAvatarUrl(raw) {
  */
 function freshenElement(element) {
     if (element instanceof HTMLImageElement) {
-        const next = versionedAvatarUrl(element.getAttribute('src') || '');
+        const next = displayAvatarUrl(element.getAttribute('src') || '', element);
 
         if (next) {
             element.setAttribute('src', next);
@@ -588,7 +668,7 @@ function freshenElement(element) {
         }
 
         const updated = value.replace(/url\(\s*(['"]?)(.*?)\1\s*\)/g, (match, quote, inner) => {
-            const next = versionedAvatarUrl(inner);
+            const next = displayAvatarUrl(inner, element);
             return next ? `url(${quote}${next}${quote})` : match;
         });
 
@@ -603,7 +683,7 @@ function freshenElement(element) {
  * @param {Element} root
  */
 function freshenTree(root) {
-    if (!avatarVersions.size || !root) {
+    if (!needsAvatarWork() || !root) {
         return;
     }
 
@@ -623,7 +703,7 @@ function watchAvatarRenders() {
     const insideMessageBody = node => node instanceof Element && !!node.closest('.mes_text, .mes_reasoning');
 
     const observer = new MutationObserver(mutations => {
-        if (!avatarVersions.size) {
+        if (!needsAvatarWork()) {
             return;
         }
 
@@ -650,6 +730,291 @@ function watchAvatarRenders() {
         attributes: true,
         attributeFilter: ['src', 'style'],
     });
+
+    // A recorded image deleted from the gallery would leave a broken avatar, so the
+    // message falls back to the persona's avatar instead. Error events do not bubble, so
+    // this listens while the event travels down, and stops it there: SillyTavern's own
+    // handler on the image would otherwise swap it for a missing-avatar icon for good.
+    document.addEventListener('error', event => {
+        const img = event.target;
+
+        if (!(img instanceof HTMLImageElement) || !isGalleryUrl(img.getAttribute('src') || '') || !chatMessageFor(img)) {
+            return;
+        }
+
+        event.stopPropagation();
+        brokenMessageImages.add(urlPath(img.getAttribute('src')));
+        freshenElement(img);
+    }, true);
+}
+
+/** Whether anything on screen may need its avatar URL rewritten. */
+function needsAvatarWork() {
+    return avatarVersions.size > 0 || messageImagesInChat;
+}
+
+/* -------------------------------------------------------------------------- */
+/*                               Message images                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The persona a message was sent as, from the avatar SillyTavern locked onto it. Older
+ * messages carry no lock and show whichever persona is selected, so they count as that.
+ * @param {object} message
+ * @returns {string|null}
+ */
+function messagePersona(message) {
+    if (!message?.force_avatar) {
+        return user_avatar || null;
+    }
+
+    return parsePersonaAvatarUrl(message.force_avatar)?.avatarId ?? null;
+}
+
+/**
+ * The gallery image a message keeps showing, or null when it follows the persona's
+ * current avatar: none recorded, the setting is off, the message now belongs to another
+ * persona, or the file failed to load.
+ * @param {object} message
+ * @returns {{ avatar: string, file: string, url: string }|null}
+ */
+function getMessageImage(message) {
+    const record = message?.extra?.[MESSAGE_IMAGE_KEY];
+
+    if (!getSettings().messageImages || !record?.url || brokenMessageImages.has(urlPath(record.url))) {
+        return null;
+    }
+
+    return record.avatar === messagePersona(message) ? record : null;
+}
+
+/**
+ * Records a gallery image on a message, so it keeps showing that image.
+ * @param {object} message
+ * @param {string} avatarId
+ * @param {string} file
+ */
+async function setMessageImage(message, avatarId, file) {
+    const folder = await resolveFolderName(avatarId);
+    message.extra ??= {};
+    message.extra[MESSAGE_IMAGE_KEY] = { avatar: avatarId, file, url: `user/images/${folder}/${file}` };
+    messageImagesInChat = true;
+}
+
+/**
+ * Records the applied gallery image on a message as it is sent, so switching later does
+ * not change the picture beside it.
+ * @param {number} messageId
+ */
+async function onMessageSent(messageId) {
+    const message = chat[messageId];
+
+    if (!getSettings().messageImages || !message?.is_user || message.extra?.[MESSAGE_IMAGE_KEY]) {
+        return;
+    }
+
+    const avatarId = messagePersona(message);
+    const active = avatarId ? getSettings().meta[avatarId]?.active : null;
+
+    // Nothing applied from the gallery yet, so the avatar is not one of its images.
+    if (!active) {
+        return;
+    }
+
+    await setMessageImage(message, avatarId, active);
+
+    // SillyTavern saved the chat just before announcing the message.
+    saveChatDebounced();
+}
+
+/**
+ * Repaints the avatars of the given messages, if they are on screen.
+ * @param {number[]} messageIds
+ */
+function repaintMessages(messageIds) {
+    for (const id of messageIds) {
+        repaintMessageElement(document.querySelector(`#chat .mes[mesid="${id}"]`));
+    }
+}
+
+/**
+ * Repaints one message's avatar. Unlike freshenTree this always runs, since a message
+ * that has just stopped keeping an image has to go back to the avatar.
+ * @param {Element|null} element
+ */
+function repaintMessageElement(element) {
+    if (element) {
+        freshenElement(element);
+        element.querySelectorAll('img, [style*="url("]').forEach(freshenElement);
+    }
+}
+
+/** Checks the newly opened chat for recorded images and shows them. */
+function onChatChangedForMessageImages() {
+    messageImagesInChat = chat.some(message => message?.extra?.[MESSAGE_IMAGE_KEY]);
+    freshenTree(document.getElementById('chat'));
+}
+
+/**
+ * Adds a button to the message actions menu for choosing which gallery image a message
+ * shows. SillyTavern copies each new message from this template.
+ */
+function addMessageButton() {
+    const button = document.createElement('div');
+    button.className = 'mes_button pg_mes_image fa-solid fa-images';
+    button.title = t`Persona image for this message`;
+
+    // The template, and any messages already on screen before the extension loaded.
+    document.querySelectorAll('#message_template .mes .extraMesButtons, #chat .mes .extraMesButtons').forEach(menu => {
+        if (!menu.querySelector('.pg_mes_image')) {
+            menu.prepend(button.cloneNode(true));
+        }
+    });
+
+    $(document).on('click', '.pg_mes_image', async function () {
+        const id = Number($(this).closest('.mes').attr('mesid'));
+
+        if (Number.isInteger(id) && chat[id]?.is_user) {
+            await openMessageImagePicker(id);
+        }
+    });
+}
+
+/**
+ * Lets the user pick which gallery image a message shows, and optionally the same for
+ * the messages before it that have none, which is how a chat sent before this feature
+ * gets its pictures back.
+ * @param {number} messageId
+ */
+async function openMessageImagePicker(messageId) {
+    const message = chat[messageId];
+    const avatarId = messagePersona(message);
+
+    if (!avatarId) {
+        toastr.warning(t`This message was not sent as one of your personas.`);
+        return;
+    }
+
+    const images = await listGallery(avatarId);
+
+    if (!images) {
+        toastr.error(t`Could not read this persona's gallery.`);
+        return;
+    }
+
+    if (!images.length) {
+        toastr.info(t`${personaName(avatarId)} has no gallery images yet.`);
+        return;
+    }
+
+    const current = getMessageImage(message)?.file ?? null;
+    let chosen = null;
+
+    // Built from nodes, not markup: labels are user text and must not be parsed as HTML.
+    const content = document.createElement('div');
+    content.classList.add('pg-message-picker');
+
+    const heading = document.createElement('h3');
+    heading.textContent = t`Image for this message`;
+
+    const hint = document.createElement('small');
+    hint.classList.add('opacity50p');
+    hint.textContent = current
+        ? t`This message keeps the outlined image. Pick another, or let it follow ${personaName(avatarId)}'s current image.`
+        : t`This message follows ${personaName(avatarId)}'s current image. Pick the one it should keep.`;
+
+    const grid = document.createElement('div');
+    grid.classList.add('pg-picker-grid');
+
+    const backfillLabel = document.createElement('label');
+    backfillLabel.classList.add('checkbox_label');
+    const backfill = document.createElement('input');
+    backfill.type = 'checkbox';
+    const backfillText = document.createElement('span');
+    backfillText.textContent = t`Also use it for the earlier messages with no image set, back to the last one that has one`;
+    backfillLabel.append(backfill, backfillText);
+
+    const popup = new Popup(content, POPUP_TYPE.TEXT, '', {
+        wide: true,
+        okButton: false,
+        cancelButton: t`Cancel`,
+        customButtons: current ? [{ text: t`Follow the current image`, icon: 'fa-rotate-left', result: RESULT_CLEAR_MESSAGE_IMAGE }] : [],
+    });
+
+    for (const image of images) {
+        const name = image.label || image.file;
+        const item = document.createElement('div');
+        item.className = 'pg-picker-item interactable';
+        item.tabIndex = 0;
+        item.title = name;
+        item.setAttribute('role', 'button');
+        item.setAttribute('aria-label', t`Use ${name} for this message`);
+        item.classList.toggle('pg-picker-current', image.file === current);
+
+        const img = document.createElement('img');
+        img.src = image.url;
+        img.loading = 'lazy';
+        img.alt = name;
+
+        const caption = document.createElement('div');
+        caption.classList.add('pg-picker-label');
+        caption.textContent = name;
+
+        item.append(img, caption);
+        item.addEventListener('click', () => {
+            chosen = image;
+            popup.complete(POPUP_RESULT.AFFIRMATIVE);
+        });
+        grid.appendChild(item);
+    }
+
+    content.append(heading, hint, grid, backfillLabel);
+    await popup.show();
+
+    // The chat may have changed while the picker was open; the id would point elsewhere.
+    if (chat[messageId] !== message) {
+        return;
+    }
+
+    if (popup.result === RESULT_CLEAR_MESSAGE_IMAGE) {
+        delete message.extra[MESSAGE_IMAGE_KEY];
+        repaintMessages([messageId]);
+        saveChatDebounced();
+        return;
+    }
+
+    if (popup.result !== POPUP_RESULT.AFFIRMATIVE || !chosen) {
+        return;
+    }
+
+    const changed = [messageId];
+
+    if (backfill.checked) {
+        for (let id = messageId - 1; id >= 0; id--) {
+            const earlier = chat[id];
+
+            if (!earlier?.is_user || messagePersona(earlier) !== avatarId) {
+                continue;
+            }
+
+            if (earlier.extra?.[MESSAGE_IMAGE_KEY]) {
+                break;
+            }
+
+            changed.push(id);
+        }
+    }
+
+    for (const id of changed) {
+        await setMessageImage(chat[id], avatarId, chosen.file);
+    }
+
+    repaintMessages(changed);
+    saveChatDebounced();
+
+    if (changed.length > 1) {
+        toastr.success(t`${chosen.label || chosen.file} is now shown on ${changed.length} messages.`);
+    }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2258,6 +2623,10 @@ function addSettingsPanel() {
                     <input id="pg_confirm_delete" type="checkbox">
                     <span>Confirm before deleting a gallery image</span>
                 </label>
+                <label class="checkbox_label" for="pg_message_images" title="Each message you send keeps showing the image your persona had then. Set it for older messages from the images button in a message's actions menu.">
+                    <input id="pg_message_images" type="checkbox">
+                    <span>Messages keep the image they were sent with</span>
+                </label>
                 <label for="pg_sort_order">Gallery order</label>
                 <select id="pg_sort_order" class="text_pole">
                     <option value="asc">Oldest first</option>
@@ -2317,6 +2686,7 @@ function addSettingsPanel() {
 
     const autoImport = /** @type {HTMLInputElement} */ (document.getElementById('pg_auto_import'));
     const confirmDelete = /** @type {HTMLInputElement} */ (document.getElementById('pg_confirm_delete'));
+    const messageImages = /** @type {HTMLInputElement} */ (document.getElementById('pg_message_images'));
     const sortOrder = /** @type {HTMLSelectElement} */ (document.getElementById('pg_sort_order'));
     const injectMode = /** @type {HTMLSelectElement} */ (document.getElementById('pg_inject_mode'));
     const injectMax = /** @type {HTMLInputElement} */ (document.getElementById('pg_inject_max'));
@@ -2329,6 +2699,7 @@ function addSettingsPanel() {
 
     autoImport.checked = settings.autoImportCurrent;
     confirmDelete.checked = settings.confirmDelete;
+    messageImages.checked = !!settings.messageImages;
     sortOrder.value = settings.sortOrder;
     injectMode.value = settings.injectMode;
     injectMax.value = String(settings.injectMax);
@@ -2393,6 +2764,14 @@ function addSettingsPanel() {
 
     confirmDelete.addEventListener('change', () => {
         getSettings().confirmDelete = confirmDelete.checked;
+        saveSettingsDebounced();
+    });
+
+    messageImages.addEventListener('change', () => {
+        getSettings().messageImages = messageImages.checked;
+        document.body.classList.toggle('pg-message-images-off', !messageImages.checked);
+        // Records are kept either way; turning this off only stops them showing.
+        document.querySelectorAll('#chat .mes').forEach(repaintMessageElement);
         saveSettingsDebounced();
     });
 
@@ -2472,6 +2851,13 @@ jQuery(async () => {
     // Opening a chat, or changing persona inside one, can pin a different image.
     eventSource.on(event_types.CHAT_CHANGED, () => applyLockedImage());
     eventSource.on(event_types.PERSONA_CHANGED, () => applyLockedImage());
+
+    // Each message keeps the image its persona had when it was sent.
+    addMessageButton();
+    document.body.classList.toggle('pg-message-images-off', !getSettings().messageImages);
+    eventSource.on(event_types.MESSAGE_SENT, onMessageSent);
+    eventSource.on(event_types.CHAT_CHANGED, onChatChangedForMessageImages);
+    onChatChangedForMessageImages();
 
     // A menu listing the previous persona's images would switch the wrong one.
     eventSource.on(event_types.CHAT_CHANGED, () => closeSwitcher());

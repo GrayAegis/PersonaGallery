@@ -183,6 +183,58 @@
     opacity: 0.35;
 }
 
+/* Message actions button: only messages you sent have a persona image to choose. */
+.mes:not([is_user="true"]) .pg_mes_image,
+.pg-message-images-off .pg_mes_image {
+    display: none;
+}
+
+.pg-message-picker {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    text-align: left;
+}
+
+.pg-message-picker .pg-picker-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+    gap: 8px;
+}
+
+.pg-message-picker .pg-picker-item {
+    border: 2px solid transparent;
+    border-radius: 8px;
+    overflow: hidden;
+    cursor: pointer;
+    background-color: var(--black30a);
+}
+
+.pg-message-picker .pg-picker-item:hover,
+.pg-message-picker .pg-picker-item:focus-visible {
+    border-color: var(--SmartThemeQuoteColor);
+}
+
+.pg-message-picker .pg-picker-item.pg-picker-current {
+    border-color: var(--golden);
+}
+
+.pg-message-picker .pg-picker-item img {
+    display: block;
+    width: 100%;
+    aspect-ratio: 2 / 3;
+    object-fit: cover;
+}
+
+.pg-message-picker .pg-picker-label {
+    padding: 2px 4px;
+    font-size: 0.8em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    background-color: var(--black70a);
+}
+
 /* Chat bar switcher. Size, opacity and hover come from SillyTavern's #leftSendForm > div rules. */
 #personaGallerySwitcher {
     order: 11;

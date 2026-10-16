@@ -65,6 +65,27 @@ no character or chat open to pin to.
 Everything in the gallery can be reached from the keyboard: Tab moves between tiles, their
 description, label and delete controls, and the pin buttons; Enter or Space activates whichever is focused.
 
+## Message images
+
+Each message you send keeps showing the image your persona had when you sent it, so switching
+to another image later does not change the picture beside your earlier messages. The choice is
+stored in the message itself and travels with the chat file, including into branches.
+
+Messages sent before this existed, or while the option was off, have nothing recorded and follow
+the persona's current image. To give them their picture back, open a message's actions menu
+(the **...** button) and click the images icon. Pick the image that message should show. Tick
+**Also use it for the earlier messages with no image set** to fill in the whole stretch above it
+in one go: it works back through your earlier messages and stops at the first one that already
+has an image. So for a chat where the persona changed outfit halfway, pick the first outfit on
+the last message before the change, then the second outfit on the latest message, both with
+the box ticked. **Follow the current image** turns a message back to following the persona.
+
+Clicking a message's avatar zooms into the image that message keeps. If a recorded image is
+deleted from the gallery, its messages fall back to the persona's current avatar. Turn the
+whole thing off with **Messages keep the image they were sent with** under
+**Extensions → Persona Gallery**. Nothing recorded is lost, and it shows again when you turn
+it back on.
+
 ## Slash commands
 
 | Command | Effect |
@@ -185,9 +206,9 @@ lost by accident. Delete the folder yourself if you want the files gone.
   applied. The original file stays in the gallery untouched.
 - Avatars are not resized on upload unless you crop them, so the gallery copy and the applied
   avatar are the same resolution.
-- Switching rewrites the persona's avatar file in place. Anything already pointing at that file,
-  including past chat messages, shows the new image. Pinning an image to a chat is the way to
-  keep a particular chat looking the way you left it.
+- Switching rewrites the persona's avatar file in place. Anything pointing at that file, such as
+  the persona list, shows the new image. Your past messages do not, because each one keeps the
+  image it was sent with (see [Message images](#message-images)).
 - Switching updates the chat live, including themes that paint avatars as CSS backgrounds,
   such as Moonlit Echoes' Echo and Whisper styles. Browsers keep showing the old picture for an
   unchanged URL until the page reloads, so each switch stamps a new version onto every URL for
