@@ -6,6 +6,6 @@
     "js": "index.js",
     "css": "style.css",
     "author": "Ethan",
-    "version": "1.8.1",
+    "version": "1.9.0",
     "auto_update": false
 }

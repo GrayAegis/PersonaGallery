@@ -87,6 +87,41 @@
     color: var(--black70a);
 }
 
+/* Where a dragged tile will land. */
+.persona-gallery-popup .pg-sort-placeholder {
+    border: 2px dashed var(--SmartThemeQuoteColor);
+    border-radius: 8px;
+    background-color: var(--black30a);
+}
+
+/* No lift while a tile is being dragged, or it drifts from the pointer. */
+.persona-gallery-popup .pg-item.ui-sortable-helper {
+    transform: none;
+    cursor: grabbing;
+    opacity: 0.85;
+}
+
+/* On touch screens the number badge is the drag handle, so give it a thumb-sized target. */
+.persona-gallery-popup.pg-touch .pg-index {
+    min-width: 28px;
+    padding: 4px 8px;
+    font-size: 0.85em;
+    cursor: grab;
+    touch-action: none;
+}
+
+.persona-gallery-popup .pg-order-reset {
+    display: block;
+    width: fit-content;
+    cursor: pointer;
+    text-decoration: underline;
+    opacity: 0.7;
+}
+
+.persona-gallery-popup .pg-order-reset:hover {
+    opacity: 1;
+}
+
 .persona-gallery-popup .pg-footer {
     display: flex;
     align-items: center;

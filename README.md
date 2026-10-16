@@ -35,6 +35,9 @@ Inside the gallery:
 - The bin icon removes the image from the gallery folder without touching the persona.
 - The lines icon beside each label opens that image's description, which you can write yourself
   or have a vision model write. See [Image descriptions](#image-descriptions).
+- Drag a tile to move it. See [Arranging images](#arranging-images).
+- The export and import buttons at the top right save the whole gallery as one file and read
+  one back. See [Exporting and importing](#exporting-and-importing).
 
 The first time you open a gallery for a persona, the avatar it already has is copied in as
 `Original`, so switching away from it is reversible. Any picture you later set with
@@ -64,6 +67,38 @@ no character or chat open to pin to.
 
 Everything in the gallery can be reached from the keyboard: Tab moves between tiles, their
 description, label and delete controls, and the pin buttons; Enter or Space activates whichever is focused.
+
+## Arranging images
+
+Drag a tile to where you want it. On a touch screen, drag it by its number badge instead, so
+that swiping still scrolls the gallery. From the keyboard, focus a tile and press Ctrl with the
+left or right arrow.
+
+The order you set is kept per persona, and everything that goes through the gallery follows it:
+the chat bar menu, Shift-click cycling, the numbers `/persona-image` takes, and which images go
+first when the whole gallery is sent to the model. Images added afterwards go at the end, or at
+the start if the gallery order setting is newest first. **Back to date order**, under the image
+count, forgets the arrangement.
+
+## Exporting and importing
+
+The export button at the top right of the gallery saves the persona's whole gallery as one
+`.json` file. It holds every image along with its label and description, the order, and the
+default and character pins. Use it to back a persona up, or to move it to another SillyTavern.
+Chat pins, and the image each of your messages keeps, are stored in the chat files and travel
+with those instead.
+
+The import button reads such a file into the persona whose gallery is open, after asking first.
+Images keep their file names, so messages in moved chats find their images again. The exception
+is a name already used in this gallery by a different picture, in which case the incoming one is
+renamed. An image already here under the same name, byte for byte, is not added twice, so
+importing the same file again only refreshes labels and descriptions. Pins from the file only
+fill in what this gallery has not set itself, and the avatar is left as it is until you click an
+image.
+
+When you move a persona, opening its gallery on the new install may first copy its current avatar
+in as `Original`. That picture usually arrives again with the import under its own name, so
+delete whichever copy you don't need.
 
 ## Message images
 

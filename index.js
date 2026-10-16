@@ -17,7 +17,7 @@ import { getMultimodalCaption } from '../../shared.js';
 import { user_avatar, getCurrentConnectionObj, getUserAvatar } from '../../../personas.js';
 import { power_user } from '../../../power-user.js';
 import { Popup, POPUP_TYPE, POPUP_RESULT } from '../../../popup.js';
-import { getBase64Async, getFileExtension, getSanitizedFilename, saveBase64AsFile } from '../../../utils.js';
+import { download, getBase64Async, getFileExtension, getSanitizedFilename, saveBase64AsFile } from '../../../utils.js';
 import { DragAndDropHandler } from '../../../dragdrop.js';
 import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
 import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
@@ -82,6 +82,9 @@ const galleryListings = new Map();
 
 /** The gallery popup that is currently open, so slash commands can refresh it. */
 let activeGallery = null;
+
+/** Set for the click that ends a tile drag, which must not also apply the image. */
+let tileDragged = false;
 
 /** Set while an avatar is being written, so overlapping switches cannot interleave. */
 let applyInFlight = false;
@@ -262,14 +265,20 @@ async function listGallery(avatarId, { fresh = false } = {}) {
         const files = await response.json();
         const folder = await resolveFolderName(avatarId);
 
-        // Files can be removed from the folder by hand, so drop labels and descriptions
-        // that no longer point anywhere.
+        // Files can be removed from the folder by hand, so drop labels, descriptions and
+        // order entries that no longer point anywhere.
         const orphanLabels = Object.keys(meta.labels).filter(file => !files.includes(file));
         const orphanDescriptions = Object.keys(meta.descriptions).filter(file => !files.includes(file));
+        const orphanOrder = Array.isArray(meta.order) && meta.order.some(file => !files.includes(file));
 
-        if (orphanLabels.length || orphanDescriptions.length) {
+        if (orphanLabels.length || orphanDescriptions.length || orphanOrder) {
             orphanLabels.forEach(file => delete meta.labels[file]);
             orphanDescriptions.forEach(file => delete meta.descriptions[file]);
+
+            if (orphanOrder) {
+                meta.order = meta.order.filter(file => files.includes(file));
+            }
+
             saveSettingsDebounced();
         }
 
@@ -300,12 +309,32 @@ function getCachedGallery(avatarId) {
  * @returns {GalleryImage[]}
  */
 function imagesFromListing(listing, meta) {
-    // Labels are read live so a rename shows without another request.
-    return listing.files.map(file => ({
+    // Labels and the order are read live so a change shows without another request.
+    return orderFiles(listing.files, meta.order).map(file => ({
         file: file,
         url: `user/images/${listing.folder}/${file}`,
         label: meta.labels[file] || '',
     }));
+}
+
+/**
+ * Puts files in the persona's own order, once it has one from dragging. Files the order
+ * does not mention yet are new, so they go where the date sort puts new files: last, or
+ * first when the gallery is set to newest first.
+ * @param {string[]} files In date order, as the server lists them.
+ * @param {string[]|null|undefined} order
+ * @returns {string[]}
+ */
+function orderFiles(files, order) {
+    if (!Array.isArray(order) || !order.length) {
+        return files;
+    }
+
+    const position = new Map(order.map((file, index) => [file, index]));
+    const known = files.filter(file => position.has(file)).sort((a, b) => position.get(a) - position.get(b));
+    const fresh = files.filter(file => !position.has(file));
+
+    return getSettings().sortOrder === 'desc' ? [...fresh, ...known] : [...known, ...fresh];
 }
 
 /**
@@ -409,6 +438,10 @@ async function deleteImage(avatarId, image) {
     const meta = getMeta(avatarId);
     delete meta.labels[image.file];
     delete meta.descriptions[image.file];
+
+    if (Array.isArray(meta.order)) {
+        meta.order = meta.order.filter(file => file !== image.file);
+    }
 
     if (meta.active === image.file) {
         meta.active = null;
@@ -1273,14 +1306,17 @@ function personaName(avatarId) {
 
 /**
  * Opens a file picker and returns the chosen files.
+ * @param {object} [options]
+ * @param {string} [options.accept='image/*']
+ * @param {boolean} [options.multiple=true]
  * @returns {Promise<File[]>}
  */
-function pickFiles() {
+function pickFiles({ accept = 'image/*', multiple = true } = {}) {
     return new Promise(resolve => {
         const input = document.createElement('input');
         input.type = 'file';
-        input.accept = 'image/*';
-        input.multiple = true;
+        input.accept = accept;
+        input.multiple = multiple;
         input.style.display = 'none';
         document.body.appendChild(input);
 
@@ -1365,6 +1401,7 @@ async function renderGallery(container, avatarId) {
     }
 
     count.textContent = images.length === 1 ? t`1 image` : t`${images.length} images`;
+    container.querySelector('.pg-order-reset')?.classList.toggle('displayNone', !(Array.isArray(meta.order) && meta.order.length));
 
     if (!images.length) {
         const empty = document.createElement('div');
@@ -1391,6 +1428,8 @@ async function renderGallery(container, avatarId) {
         img.src = image.url;
         img.loading = 'lazy';
         img.alt = image.label || image.file;
+        // The browser's own image drag would fight the tile reordering.
+        img.draggable = false;
         tile.appendChild(img);
 
         const badge = document.createElement('div');
@@ -1477,6 +1516,10 @@ function renderLockRow(container, avatarId) {
  */
 async function onTileClick(event, container, avatarId, image) {
     const target = /** @type {HTMLElement} */ (event.target);
+
+    if (tileDragged) {
+        return;
+    }
 
     if (target.classList.contains('pg-describe')) {
         event.stopPropagation();
@@ -1737,6 +1780,7 @@ async function openGallery(avatarId) {
             <div class="flex1 pg-heading">
                 <h3 class="margin0"></h3>
                 <small class="pg-count opacity50p"></small>
+                <small class="pg-order-reset interactable displayNone" role="button"></small>
             </div>
             <div class="pg-describe-all menu_button menu_button_icon displayNone">
                 <i class="fa-solid fa-align-left"></i>
@@ -1746,6 +1790,8 @@ async function openGallery(avatarId) {
                 <i class="fa-solid fa-plus"></i>
                 <span></span>
             </div>
+            <div class="pg-export menu_button fa-solid fa-file-export" role="button"></div>
+            <div class="pg-import menu_button fa-solid fa-file-import" role="button"></div>
         </div>
         <div class="pg-grid"></div>
         <div class="pg-locks flex-container alignitemscenter">
@@ -1767,9 +1813,15 @@ async function openGallery(avatarId) {
     container.querySelector('.pg-add span').textContent = t`Add images`;
     container.querySelector('.pg-describe-all span').textContent = t`Describe all`;
     container.querySelector('.pg-describe-all').title = t`Describe every image that has no description yet`;
+    container.querySelector('.pg-order-reset').textContent = t`Back to date order`;
+    container.querySelector('.pg-order-reset').title = t`Forget the order you dragged the images into`;
+    container.querySelector('.pg-export').title = t`Export this gallery as one file: images, labels, descriptions, order and pins`;
+    container.querySelector('.pg-export').setAttribute('aria-label', t`Export this gallery`);
+    container.querySelector('.pg-import').title = t`Import a gallery file into this persona`;
+    container.querySelector('.pg-import').setAttribute('aria-label', t`Import a gallery file`);
     container.querySelector('.pg-locks-label').textContent = t`Pin the current image to:`;
     container.querySelector('.pg-hint').textContent =
-        t`Click an image to make it this persona's avatar. Drop image files here to add them.`;
+        t`Click an image to make it this persona's avatar. Drag images to arrange them. Drop image files here to add them.`;
 
     const lockLabels = {
         default: t`Default`,
@@ -1821,6 +1873,22 @@ async function openGallery(avatarId) {
         await renderGallery(container, avatarId);
     });
 
+    container.querySelector('.pg-order-reset').addEventListener('click', async () => {
+        getMeta(avatarId).order = null;
+        saveSettingsDebounced();
+        await renderGallery(container, avatarId);
+    });
+
+    container.querySelector('.pg-export').addEventListener('click', () => exportGallery(avatarId));
+
+    container.querySelector('.pg-import').addEventListener('click', async () => {
+        if (await importGallery(avatarId) && activeGallery?.container === container) {
+            await renderGallery(container, avatarId);
+        }
+    });
+
+    setupReordering(container, avatarId);
+
     // The handler delegates from document.body, so it needs a selector string rather than the node.
     const dropHandler = new DragAndDropHandler('.persona-gallery-popup', async files => {
         const images = files.filter(file => file.type.startsWith('image/'));
@@ -1848,6 +1916,381 @@ async function openGallery(avatarId) {
 
     await renderGallery(container, avatarId);
     await popup.show();
+}
+
+/**
+ * Lets the tiles be dragged into the persona's own order. That order then decides the
+ * chat bar menu, Shift-click cycling, the numbers slash commands use, and which images
+ * the whole-gallery send takes first. Uses SillyTavern's bundled jQuery UI, which works
+ * by mouse and, through touch-punch, by touch; the browser's own drag and drop would set
+ * off the drop-files-here overlay.
+ * @param {HTMLElement} container
+ * @param {string} avatarId
+ */
+function setupReordering(container, avatarId) {
+    const grid = container.querySelector('.pg-grid');
+
+    // On a touch screen a swipe across the grid has to scroll it, so tiles are moved by
+    // their number badge instead.
+    const touch = !!window.matchMedia?.('(pointer: coarse)').matches;
+    container.classList.toggle('pg-touch', touch);
+
+    $(grid).sortable({
+        items: '> .pg-item',
+        handle: touch ? '.pg-index' : false,
+        distance: 6,
+        tolerance: 'pointer',
+        cursor: 'grabbing',
+        placeholder: 'pg-sort-placeholder',
+        forcePlaceholderSize: true,
+        start: () => {
+            tileDragged = true;
+        },
+        stop: () => {
+            const files = [...grid.querySelectorAll('.pg-item')].map(tile => tile.dataset.file);
+
+            // The click that ends a drag arrives after this and must not apply the image.
+            // Saving waits too, so the grid is not rebuilt while jQuery UI is still tidying up.
+            setTimeout(() => {
+                tileDragged = false;
+                saveOrder(container, avatarId, files);
+            });
+        },
+    });
+
+    // jQuery UI works out whether items sit side by side from their float or inline
+    // display, and a CSS grid has neither, so it would treat the tiles as one column and
+    // ignore sideways moves. They wrap in rows, which is what floating means to it.
+    const sortable = $(grid).sortable('instance');
+
+    if (sortable) {
+        sortable._isFloating = () => true;
+    }
+
+    // Ctrl and the arrow keys move a focused tile, for anyone not using a mouse.
+    grid.addEventListener('keydown', event => {
+        const tile = event.target instanceof HTMLElement ? event.target.closest('.pg-item') : null;
+
+        if (!tile || !(event.ctrlKey || event.metaKey) || !['ArrowLeft', 'ArrowRight'].includes(event.key)) {
+            return;
+        }
+
+        event.preventDefault();
+        event.stopPropagation();
+
+        const files = [...grid.querySelectorAll('.pg-item')].map(item => item.dataset.file);
+        const from = files.indexOf(tile.dataset.file);
+        const to = from + (event.key === 'ArrowLeft' ? -1 : 1);
+
+        if (to < 0 || to >= files.length) {
+            return;
+        }
+
+        files.splice(to, 0, files.splice(from, 1)[0]);
+        saveOrder(container, avatarId, files, tile.dataset.file);
+    });
+}
+
+/**
+ * Stores the persona's own image order and redraws the gallery in it.
+ * @param {HTMLElement} container
+ * @param {string} avatarId
+ * @param {string[]} files
+ * @param {string|null} [focusFile] Tile to focus afterwards, when moved by keyboard.
+ */
+async function saveOrder(container, avatarId, files, focusFile = null) {
+    getMeta(avatarId).order = files;
+    saveSettingsDebounced();
+
+    if (activeGallery?.container !== container) {
+        return;
+    }
+
+    await renderGallery(container, avatarId);
+
+    if (focusFile) {
+        /** @type {HTMLElement|null} */ (container.querySelector(`.pg-item[data-file="${CSS.escape(focusFile)}"]`))?.focus();
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                              Export and import                             */
+/* -------------------------------------------------------------------------- */
+
+/** Marks a file as a Persona Gallery export. */
+const EXPORT_TYPE = 'persona-gallery';
+
+/** Format version written into exports. Imports refuse anything newer. */
+const EXPORT_VERSION = 1;
+
+/**
+ * Saves a persona's whole gallery as one JSON file: every image, with its label,
+ * description, the order and the default and character pins. Chat pins and the image
+ * each message keeps live in the chat files, so they travel with those instead.
+ * @param {string} avatarId
+ */
+async function exportGallery(avatarId) {
+    const images = await listGallery(avatarId, { fresh: true });
+
+    if (!images) {
+        toastr.error(t`Could not read this persona's gallery.`);
+        return;
+    }
+
+    if (!images.length) {
+        toastr.info(t`This gallery has no images to export.`);
+        return;
+    }
+
+    const meta = getMeta(avatarId);
+    const files = new Set(images.map(image => image.file));
+    const pending = toastr.info(t`Packing ${images.length} images…`, '', { timeOut: 0, extendedTimeOut: 0 });
+
+    try {
+        const entries = [];
+
+        for (const image of images) {
+            const response = await fetch(image.url, { cache: 'no-cache' });
+
+            if (!response.ok) {
+                throw new Error(t`Could not read ${image.label || image.file}.`);
+            }
+
+            entries.push({
+                file: image.file,
+                label: meta.labels[image.file] || null,
+                description: meta.descriptions[image.file] ?? null,
+                data: await getBase64Async(await response.blob()),
+            });
+        }
+
+        const bundle = {
+            type: EXPORT_TYPE,
+            version: EXPORT_VERSION,
+            exportedAt: new Date().toISOString(),
+            persona: personaName(avatarId),
+            active: files.has(meta.active) ? meta.active : null,
+            fallback: files.has(meta.fallback) ? meta.fallback : null,
+            locks: Object.fromEntries(Object.entries(meta.locks).filter(([, file]) => files.has(file))),
+            order: Array.isArray(meta.order) && meta.order.length ? images.map(image => image.file) : null,
+            images: entries,
+        };
+
+        download(JSON.stringify(bundle), `${personaName(avatarId)} - Persona Gallery.json`, 'application/json');
+        toastr.success(images.length === 1 ? t`Exported 1 image.` : t`Exported ${images.length} images.`);
+    } catch (error) {
+        console.error('[Persona Gallery] Export failed', error);
+        toastr.error(String(error?.message || error), t`Could not export the gallery`);
+    } finally {
+        toastr.clear(pending);
+    }
+}
+
+/**
+ * Reads an export back into a persona's gallery. Images keep their file names, so the
+ * images that chat messages keep still match after a move, unless that name is already
+ * taken by a different picture. One already here under the same name, byte for byte, is
+ * not added twice, so importing the same file again only refreshes labels and
+ * descriptions. Pins only fill in what this gallery has not set itself.
+ * @param {string} avatarId
+ * @returns {Promise<boolean>} Whether anything changed.
+ */
+async function importGallery(avatarId) {
+    const [file] = await pickFiles({ accept: '.json,application/json', multiple: false });
+
+    if (!file) {
+        return false;
+    }
+
+    let bundle;
+
+    try {
+        bundle = JSON.parse(await file.text());
+    } catch {
+        bundle = null;
+    }
+
+    if (bundle?.type !== EXPORT_TYPE || !Array.isArray(bundle.images)) {
+        toastr.error(t`That file is not a Persona Gallery export.`);
+        return false;
+    }
+
+    if (Number(bundle.version) > EXPORT_VERSION) {
+        toastr.error(t`That file was made by a newer version of Persona Gallery. Update the extension first.`);
+        return false;
+    }
+
+    const count = bundle.images.length;
+    const from = typeof bundle.persona === 'string' && bundle.persona ? bundle.persona : t`another persona`;
+    const confirmed = await Popup.show.confirm(
+        count === 1 ? t`Import 1 image into ${personaName(avatarId)}?` : t`Import ${count} images into ${personaName(avatarId)}?`,
+        t`From ${from}'s gallery, with labels, descriptions, the image order and pins. Images already in this gallery stay, and one that is already here is not added twice.`,
+    );
+
+    if (confirmed !== POPUP_RESULT.AFFIRMATIVE) {
+        return false;
+    }
+
+    const before = await listGallery(avatarId, { fresh: true });
+
+    if (!before) {
+        toastr.error(t`Could not read this persona's gallery.`);
+        return false;
+    }
+
+    // By lower case, since Windows treats names that differ only in case as the same file.
+    const taken = new Map(before.map(image => [image.file.toLowerCase(), image]));
+    const folder = rawFolderName(avatarId);
+    /** @type {Map<string, string>} File name in the export to file name in this gallery. */
+    const names = new Map();
+    let added = 0;
+    let present = 0;
+    let failed = 0;
+
+    const pending = toastr.info(t`Importing ${count} images…`, '', { timeOut: 0, extendedTimeOut: 0 });
+
+    try {
+        for (const entry of bundle.images) {
+            const match = /^data:image\/[\w.+-]+;base64,(.+)$/s.exec(String(entry?.data ?? ''));
+            // Only the last path segment, so a crafted name cannot reach outside the folder.
+            const name = String(entry?.file ?? '').split(/[\\/]/).pop();
+            const extension = name.split('.').pop().toLowerCase();
+            const stem = name.replace(/\.[^.]+$/, '').replace(/[^\w\- ]+/g, '').slice(0, 60) || 'image';
+
+            if (!match || !ALLOWED_EXTENSIONS.includes(extension)) {
+                failed++;
+                continue;
+            }
+
+            try {
+                const base64 = match[1];
+                const existing = taken.get(`${stem}.${extension}`.toLowerCase());
+
+                if (existing && await sameImage(existing.url, base64)) {
+                    names.set(entry.file, existing.file);
+                    present++;
+                    continue;
+                }
+
+                const unique = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+                const path = await saveBase64AsFile(base64, folder, existing ? `${stem}-${unique}` : stem, extension);
+                const savedName = String(path).split('/').pop();
+
+                names.set(entry.file, savedName);
+                taken.set(savedName.toLowerCase(), { file: savedName, url: `user/images/${await resolveFolderName(avatarId)}/${savedName}`, label: '' });
+                added++;
+            } catch (error) {
+                console.error('[Persona Gallery] Could not import', name, error);
+                failed++;
+            }
+        }
+    } finally {
+        toastr.clear(pending);
+        galleryListings.delete(avatarId);
+    }
+
+    // The persona may have been deleted while files were being written; don't revive it.
+    const meta = getSettings().meta[avatarId];
+
+    if (meta && names.size) {
+        applyImportedMeta(meta, bundle, names, before.map(image => image.file));
+        saveSettingsDebounced();
+    }
+
+    const parts = [];
+
+    if (added) {
+        parts.push(added === 1 ? t`Added 1 image.` : t`Added ${added} images.`);
+    }
+
+    if (present) {
+        parts.push(present === 1 ? t`1 was already here.` : t`${present} were already here.`);
+    }
+
+    if (failed) {
+        parts.push(failed === 1 ? t`1 could not be read.` : t`${failed} could not be read.`);
+    }
+
+    (failed ? toastr.warning : toastr.success)(parts.join(' ') || t`Nothing to import.`);
+    return names.size > 0;
+}
+
+/**
+ * Copies an export's labels, descriptions, order and pins onto the imported files.
+ * @param {object} meta The persona's gallery record.
+ * @param {object} bundle The parsed export.
+ * @param {Map<string, string>} names File name in the export to file name in this gallery.
+ * @param {string[]} before This gallery's files before the import, in its own order.
+ */
+function applyImportedMeta(meta, bundle, names, before) {
+    const mapped = file => (typeof file === 'string' && names.get(file)) || null;
+
+    for (const entry of bundle.images) {
+        const file = mapped(entry?.file);
+
+        if (!file) {
+            continue;
+        }
+
+        if (typeof entry.label === 'string' && entry.label.trim()) {
+            meta.labels[file] = entry.label.trim();
+        }
+
+        const description = entry.description;
+
+        if (typeof description?.text === 'string' && description.text.trim()) {
+            meta.descriptions[file] = {
+                text: description.text.trim(),
+                model: typeof description.model === 'string' ? description.model : '',
+                at: Number(description.at) || Date.now(),
+                ...(description.edited ? { edited: true } : {}),
+            };
+        }
+    }
+
+    // Pins fill gaps only, so this gallery's own choices win.
+    meta.fallback ??= mapped(bundle.fallback);
+
+    if (bundle.locks && typeof bundle.locks === 'object') {
+        for (const [key, file] of Object.entries(bundle.locks)) {
+            if (!meta.locks[key] && mapped(file)) {
+                meta.locks[key] = mapped(file);
+            }
+        }
+    }
+
+    // A gallery that was empty takes the export's order; one that had images keeps its
+    // own and gains the new ones after it, in the export's order.
+    const exportOrder = (Array.isArray(bundle.order) ? bundle.order : bundle.images.map(entry => entry?.file))
+        .map(mapped)
+        .filter(Boolean);
+    const hadOwnImages = before.some(file => ![...names.values()].includes(file));
+
+    if (Array.isArray(bundle.order) || Array.isArray(meta.order)) {
+        meta.order = hadOwnImages
+            ? [...before, ...exportOrder.filter(file => !before.includes(file))]
+            : [...exportOrder, ...before.filter(file => !exportOrder.includes(file))];
+    }
+}
+
+/**
+ * Whether a gallery file holds exactly the given image data.
+ * @param {string} url
+ * @param {string} base64
+ */
+async function sameImage(url, base64) {
+    try {
+        const response = await fetch(url, { cache: 'no-cache' });
+
+        if (!response.ok) {
+            return false;
+        }
+
+        const dataUrl = await getBase64Async(await response.blob());
+        return dataUrl.slice(dataUrl.indexOf(',') + 1) === base64;
+    } catch {
+        return false;
+    }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2637,6 +3080,9 @@ function addSettingsPanel() {
                     <option value="asc">Oldest first</option>
                     <option value="desc">Newest first</option>
                 </select>
+                <div class="opacity50p">
+                    Dragging images in a gallery gives that persona its own order, which wins over this.
+                </div>
                 <label for="pg_inject_mode">Send images to the model</label>
                 <select id="pg_inject_mode" class="text_pole">
                     <option value="off">Do not send</option>
