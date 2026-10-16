@@ -625,7 +625,12 @@ function displayAvatarUrl(raw, element) {
         const record = getMessageImage(message);
 
         if (record) {
-            return urlPath(raw) === urlPath(record.url) ? null : record.url;
+            // Always from the site root. Themes such as Moonlit Echoes copy the URL into a
+            // CSS variable, and a relative URL there resolves against the theme's own
+            // stylesheet folder instead of the page, so the background never loads.
+            // Records written by 1.8.0 are relative, hence the fix-up here.
+            const url = record.url.startsWith('/') ? record.url : `/${record.url}`;
+            return urlPath(raw) === urlPath(url) ? null : url;
         }
 
         // The record was cleared, failed to load or no longer applies: back to the avatar.
@@ -797,7 +802,7 @@ function getMessageImage(message) {
 async function setMessageImage(message, avatarId, file) {
     const folder = await resolveFolderName(avatarId);
     message.extra ??= {};
-    message.extra[MESSAGE_IMAGE_KEY] = { avatar: avatarId, file, url: `user/images/${folder}/${file}` };
+    message.extra[MESSAGE_IMAGE_KEY] = { avatar: avatarId, file, url: `/user/images/${folder}/${file}` };
     messageImagesInChat = true;
 }
 
