@@ -181,6 +181,28 @@ it empty for a prompt that asks for build, face, hair, eyes, skin, clothing and 
 in plain prose. Once a vision model is set up, **Describe all** at the top of the gallery fills in
 every image that has no description yet.
 
+### Replacing the persona description
+
+An image's description can stand in for the whole persona description, for a transformation, a
+different identity, or anything else that changes more than an outfit. Open the image's
+description, tick **Replace persona description**, write the full persona description that should
+apply while that image is in use, and save. The image's icon turns into theatre masks.
+
+While that image is applied, its text *is* the persona's description. Persona Management shows it,
+and every preset, `{{persona}}` macro and persona prompt position uses it, so nothing in the
+prompt needs changing. The persona's own description is set aside in the gallery's settings, and
+comes back as soon as you switch to an image without the box ticked, or delete the image. Moving
+from one replacing image to another swaps the text without losing the original. Chat and
+character pins switch images, and so switch descriptions, as well.
+
+If you edit the description in Persona Management while an image's text is standing in, the edit
+is saved to that image, since that is the text you were looking at. The gallery shows a note while
+an image's text is in use. Replacing text is not also sent through `{{galleryLook}}` or in place
+of the image, because it is already in the prompt as the persona description.
+
+Switch back to an ordinary image before removing the extension, or the persona keeps the
+replacing text.
+
 ### Sending descriptions with `{{galleryLook}}`
 
 Write `{{galleryLook}}` where you want the description to go. The usual place is the end of the

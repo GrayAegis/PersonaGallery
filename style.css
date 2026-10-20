@@ -188,6 +188,19 @@
     opacity: 1;
 }
 
+/* Says which image's text is standing in for the persona description. */
+.persona-gallery-popup .pg-replace-note {
+    padding: 6px 10px;
+    border-left: 3px solid var(--golden);
+    border-radius: 4px;
+    font-size: 0.85em;
+    background-color: var(--black30a);
+}
+
+.pg-replace-toggle {
+    margin: 6px 0 2px;
+}
+
 /* Marks the images that already have a description stored. */
 .persona-gallery-popup .pg-describe.pg-described {
     opacity: 1;

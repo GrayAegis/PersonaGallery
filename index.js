@@ -14,7 +14,7 @@ import {
 import { isImageInliningSupported, oai_settings } from '../../../openai.js';
 import { extension_settings } from '../../../extensions.js';
 import { getMultimodalCaption } from '../../shared.js';
-import { user_avatar, getCurrentConnectionObj, getUserAvatar } from '../../../personas.js';
+import { user_avatar, getCurrentConnectionObj, getOrCreatePersonaDescriptor, getUserAvatar, setPersonaDescription } from '../../../personas.js';
 import { power_user } from '../../../power-user.js';
 import { Popup, POPUP_TYPE, POPUP_RESULT } from '../../../popup.js';
 import { download, getBase64Async, getFileExtension, getSanitizedFilename, saveBase64AsFile } from '../../../utils.js';
@@ -457,6 +457,9 @@ async function deleteImage(avatarId, image) {
         .forEach(key => delete meta.locks[key]);
 
     saveSettingsDebounced();
+
+    // An image whose text was standing in for the persona description takes it with it.
+    syncPersonaDescription(avatarId, { announce: true });
     return true;
 }
 
@@ -501,6 +504,7 @@ async function applyImage(avatarId, image) {
         const meta = getMeta(avatarId);
         meta.active = image.file;
         saveSettingsDebounced();
+        syncPersonaDescription(avatarId, { announce: true });
 
         await refreshAvatarDisplays(avatarId);
 
@@ -1401,6 +1405,14 @@ async function renderGallery(container, avatarId) {
     }
 
     count.textContent = images.length === 1 ? t`1 image` : t`${images.length} images`;
+
+    const replaceNote = container.querySelector('.pg-replace-note');
+    const replacedBy = meta.replacedBy ? images.find(image => image.file === meta.replacedBy) : null;
+    replaceNote?.classList.toggle('displayNone', !replacedBy);
+
+    if (replaceNote && replacedBy) {
+        replaceNote.textContent = t`${replacedBy.label || replacedBy.file}'s text is standing in for ${personaName(avatarId)}'s persona description. Switch to an image without Replace persona description ticked to bring the original back.`;
+    }
     container.querySelector('.pg-order-reset')?.classList.toggle('displayNone', !(Array.isArray(meta.order) && meta.order.length));
 
     if (!images.length) {
@@ -1446,10 +1458,13 @@ async function renderGallery(container, avatarId) {
         // shows at a glance which images have a description. Shown whatever the send
         // setting, since {{galleryLook}} sends descriptions on its own.
         const described = !!meta.descriptions[image.file]?.text;
+        const replaces = described && !!meta.descriptions[image.file]?.replaces;
         const describe = document.createElement('i');
-        describe.className = 'fa-solid fa-align-left pg-action pg-describe interactable';
+        describe.className = `fa-solid ${replaces ? 'fa-masks-theater' : 'fa-align-left'} pg-action pg-describe interactable`;
         describe.classList.toggle('pg-described', described);
-        describe.title = described ? t`Read or edit the description` : t`Write or generate a description`;
+        describe.title = replaces
+            ? t`Replaces the persona description while applied. Click to read or edit it.`
+            : described ? t`Read or edit the description` : t`Write or generate a description`;
         describe.setAttribute('role', 'button');
         describe.setAttribute('aria-label', t`Description of ${image.label || image.file}`);
 
@@ -1614,13 +1629,15 @@ async function describeWithFeedback(avatarId, image, force) {
  * @param {GalleryImage} image
  */
 async function openDescriptionEditor(avatarId, image) {
-    // Unsaved typing, kept across a describe attempt that fails.
+    // Unsaved typing and ticking, kept across a describe attempt.
     let draft = null;
+    let draftReplaces = null;
 
     // Describing reopens the editor with the new text, so the loop ends on save or cancel.
     while (true) {
         const entry = getSettings().meta[avatarId]?.descriptions?.[image.file];
         const stored = entry?.text || '';
+        const storedReplaces = !!entry?.replaces;
 
         // Built from nodes, not markup: the label is user text and must not be parsed as HTML.
         const content = document.createElement('div');
@@ -1638,12 +1655,28 @@ async function openDescriptionEditor(avatarId, image) {
             source.textContent = entry.edited ? t`Written by ${entry.model}, edited ${when}.` : t`Written by ${entry.model}, ${when}.`;
         }
 
+        const replaceLabel = document.createElement('label');
+        replaceLabel.classList.add('checkbox_label', 'pg-replace-toggle');
+        const replace = document.createElement('input');
+        replace.type = 'checkbox';
+        replace.checked = draftReplaces ?? storedReplaces;
+        const replaceText = document.createElement('span');
+        replaceText.textContent = t`Replace persona description`;
+        replaceLabel.append(replace, replaceText);
+
         const where = document.createElement('small');
         where.classList.add('opacity50p');
-        where.textContent = isDescriptionMode()
-            ? t`Sent in place of the image, through {{galleryLook}} or on your latest message.`
-            : t`Sent wherever {{galleryLook}} appears in the prompt.`;
-        content.append(heading, source, document.createElement('br'), where);
+        const explainWhere = () => {
+            where.textContent = replace.checked
+                ? t`While this image is applied, this text is ${personaName(avatarId)}'s whole persona description, wherever your preset uses it. The original comes back when you switch to an image without this ticked.`
+                : isDescriptionMode()
+                    ? t`Sent in place of the image, through {{galleryLook}} or on your latest message.`
+                    : t`Sent wherever {{galleryLook}} appears in the prompt.`;
+        };
+        explainWhere();
+        replace.addEventListener('change', explainWhere);
+
+        content.append(heading, source, replaceLabel, where);
 
         const popup = new Popup(content, POPUP_TYPE.INPUT, draft ?? stored, {
             rows: 10,
@@ -1661,6 +1694,7 @@ async function openDescriptionEditor(avatarId, image) {
 
         if (popup.result === RESULT_REDESCRIBE) {
             draft = String(popup.value ?? '');
+            draftReplaces = replace.checked;
 
             if (await describeWithFeedback(avatarId, image, true)) {
                 draft = null;
@@ -1681,23 +1715,160 @@ async function openDescriptionEditor(avatarId, image) {
         }
 
         const text = String(popup.value ?? '').trim();
+        const textChanged = text !== stored.trim();
 
         // Saving untouched text must not mark the vision model's description as edited.
-        if (text === stored.trim()) {
+        if (!textChanged && replace.checked === storedReplaces) {
             return;
         }
 
         if (!text) {
             // In description mode, an emptied description is written again when next needed.
             delete meta.descriptions[image.file];
-        } else if (entry?.model) {
-            meta.descriptions[image.file] = { ...entry, text, at: Date.now(), edited: true };
         } else {
-            meta.descriptions[image.file] = { text, model: '', at: Date.now() };
+            const next = !entry
+                ? { text, model: '', at: Date.now() }
+                : textChanged
+                    ? { ...entry, text, at: Date.now(), ...(entry.model ? { edited: true } : {}) }
+                    : { ...entry };
+
+            if (replace.checked) {
+                next.replaces = true;
+            } else {
+                delete next.replaces;
+            }
+
+            meta.descriptions[image.file] = next;
         }
 
         saveSettingsDebounced();
+        syncPersonaDescription(avatarId, { announce: true });
         return;
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                       Replacing the persona description                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The persona's description as SillyTavern currently holds it.
+ * @param {string} avatarId
+ * @returns {string}
+ */
+function readPersonaDescription(avatarId) {
+    if (avatarId === user_avatar) {
+        return String(power_user.persona_description ?? '');
+    }
+
+    return String(power_user.persona_descriptions?.[avatarId]?.description ?? '');
+}
+
+/**
+ * Sets the persona's description the way typing in Persona Management would, so every
+ * preset, macro and prompt position that uses it picks the change up.
+ * @param {string} avatarId
+ * @param {string} text
+ */
+function writePersonaDescription(avatarId, text) {
+    const descriptor = avatarId === user_avatar
+        ? getOrCreatePersonaDescriptor()
+        : power_user.persona_descriptions?.[avatarId];
+
+    if (descriptor) {
+        descriptor.description = text;
+    }
+
+    if (avatarId === user_avatar) {
+        power_user.persona_description = text;
+        setPersonaDescription();
+    }
+
+    // The persona list shows each description under its name.
+    document.querySelectorAll('.avatar-container').forEach(card => {
+        if (card instanceof HTMLElement && card.dataset.avatarId === avatarId) {
+            $(card).find('.ch_description')
+                .text(text || $('#user_avatar_block').attr('no_desc_text') || '')
+                .toggleClass('text_muted', !text);
+        }
+    });
+
+    saveSettingsDebounced();
+
+    if (event_types.PERSONA_UPDATED) {
+        eventSource.emit(event_types.PERSONA_UPDATED, avatarId);
+    }
+}
+
+/**
+ * Makes the persona's description match the applied image: that image's text when it is
+ * ticked to replace the persona description, otherwise the persona's own description,
+ * which is set aside in the gallery record while it is replaced and put back afterwards.
+ * Anything typed into Persona Management while an image's text was standing in is kept
+ * as that image's text, since that is what was being edited.
+ * @param {string} avatarId
+ * @param {object} [options]
+ * @param {boolean} [options.announce=false] Say so when the description changes.
+ */
+function syncPersonaDescription(avatarId, { announce = false } = {}) {
+    const meta = avatarId ? getSettings().meta[avatarId] : null;
+
+    if (!meta) {
+        return;
+    }
+
+    const descriptions = meta.descriptions ?? {};
+    const current = readPersonaDescription(avatarId);
+
+    if (meta.replacedBy && typeof meta.replacedText === 'string' && current !== meta.replacedText && current.trim()) {
+        const shown = descriptions[meta.replacedBy];
+
+        if (shown?.replaces) {
+            shown.text = current;
+            shown.at = Date.now();
+
+            if (shown.model) {
+                shown.edited = true;
+            }
+        }
+    }
+
+    const entry = meta.active ? descriptions[meta.active] : null;
+    const replacement = entry?.replaces && entry.text?.trim() ? entry : null;
+
+    if (replacement) {
+        if (!meta.replacedBy) {
+            meta.baseDescription = current;
+        }
+
+        const changed = current !== replacement.text;
+        meta.replacedBy = meta.active;
+        meta.replacedText = replacement.text;
+        saveSettingsDebounced();
+
+        if (changed) {
+            writePersonaDescription(avatarId, replacement.text);
+
+            if (announce) {
+                const label = getMeta(avatarId).labels[meta.active] || meta.active;
+                toastr.info(t`${personaName(avatarId)}'s persona description is now ${label}'s text.`);
+            }
+        }
+
+        return;
+    }
+
+    if (meta.replacedBy) {
+        const original = typeof meta.baseDescription === 'string' ? meta.baseDescription : '';
+        delete meta.replacedBy;
+        delete meta.replacedText;
+        delete meta.baseDescription;
+        saveSettingsDebounced();
+        writePersonaDescription(avatarId, original);
+
+        if (announce) {
+            toastr.info(t`${personaName(avatarId)}'s own persona description is back.`);
+        }
     }
 }
 
@@ -1793,6 +1964,7 @@ async function openGallery(avatarId) {
             <div class="pg-export menu_button fa-solid fa-file-export" role="button"></div>
             <div class="pg-import menu_button fa-solid fa-file-import" role="button"></div>
         </div>
+        <div class="pg-replace-note displayNone"></div>
         <div class="pg-grid"></div>
         <div class="pg-locks flex-container alignitemscenter">
             <span class="pg-locks-label opacity50p"></span>
@@ -2195,6 +2367,9 @@ async function importGallery(avatarId) {
     if (meta && names.size) {
         applyImportedMeta(meta, bundle, names, before.map(image => image.file));
         saveSettingsDebounced();
+
+        // The applied image may have just gained text that replaces the persona description.
+        syncPersonaDescription(avatarId, { announce: true });
     }
 
     const parts = [];
@@ -2244,6 +2419,7 @@ function applyImportedMeta(meta, bundle, names, before) {
                 model: typeof description.model === 'string' ? description.model : '',
                 at: Number(description.at) || Date.now(),
                 ...(description.edited ? { edited: true } : {}),
+                ...(description.replaces ? { replaces: true } : {}),
             };
         }
     }
@@ -2421,8 +2597,14 @@ async function describeImage(avatarId, image, { force = false } = {}) {
 
         if (meta) {
             meta.descriptions ??= {};
-            meta.descriptions[image.file] = { text, model, at: Date.now() };
+            // Describing again keeps the image's choice to replace the persona description.
+            const replaces = !!meta.descriptions[image.file]?.replaces;
+            meta.descriptions[image.file] = { text, model, at: Date.now(), ...(replaces ? { replaces: true } : {}) };
             saveSettingsDebounced();
+
+            if (replaces) {
+                syncPersonaDescription(avatarId, { announce: true });
+            }
         }
 
         return text;
@@ -2618,6 +2800,11 @@ async function collectDescriptions(images, avatarId, dryRun) {
 
     // In parallel, so the whole-gallery mode waits for the slowest image rather than the sum.
     return await Promise.all(images.map(async image => {
+        // Text that replaces the persona description is already in the prompt as that.
+        if (descriptions[image.file]?.replaces) {
+            return null;
+        }
+
         const stored = descriptions[image.file]?.text;
 
         if (stored || dryRun) {
@@ -2697,7 +2884,9 @@ function renderLook() {
 
     const images = pickImagesToSend(avatarId, getCachedGallery(avatarId));
     const descriptions = images.length ? getMeta(avatarId).descriptions : {};
-    const text = formatDescriptions(avatarId, images, images.map(image => descriptions[image.file]?.text || null));
+    // Text that replaces the persona description is already in the prompt as that.
+    const texts = images.map(image => (descriptions[image.file]?.replaces ? null : descriptions[image.file]?.text) || null);
+    const text = formatDescriptions(avatarId, images, texts);
 
     renderedLook = text || null;
     return text;
@@ -3257,6 +3446,7 @@ function watchExternalAvatarChanges() {
             // is one step ahead; the next switch or chat load puts it right.
             getMeta(avatarId).active = savedName;
             saveSettingsDebounced();
+            syncPersonaDescription(avatarId, { announce: true });
             console.debug('[Persona Gallery] Captured an externally set avatar for', avatarId);
         }
 
@@ -3302,6 +3492,11 @@ jQuery(async () => {
     // Opening a chat, or changing persona inside one, can pin a different image.
     eventSource.on(event_types.CHAT_CHANGED, () => applyLockedImage());
     eventSource.on(event_types.PERSONA_CHANGED, () => applyLockedImage());
+
+    // Catches edits made in Persona Management while an image's text replaced the
+    // persona description, and anything that drifted while the page was closed.
+    eventSource.on(event_types.APP_READY, () => syncPersonaDescription(user_avatar));
+    eventSource.on(event_types.PERSONA_CHANGED, () => syncPersonaDescription(user_avatar));
 
     // Each message keeps the image its persona had when it was sent.
     addMessageButton();
