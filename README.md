@@ -3,6 +3,10 @@
 Give each SillyTavern persona a set of images instead of a single avatar, and switch between
 them from inside SillyTavern.
 
+This README explains each feature. For how they fit together, with worked setups for a persona
+with several looks, an alternate identity, a transformation, and moving a persona to another
+install, see the [how-to guide](HOWTO.md).
+
 ## What it does
 
 A persona in SillyTavern is identified by its avatar file, so a persona can only ever have one
@@ -162,7 +166,8 @@ reference images were attached.
 ## Image descriptions
 
 Each image can carry a written description of what it shows, which text-only models can use in
-place of the picture.
+place of the picture. The [how-to guide](HOWTO.md) covers what to put in the persona description
+and what to put in each image's, and when to use **Replace persona description**.
 
 ### Writing a description
 
